@@ -71,12 +71,17 @@ MODEL_COMPUTE_DTYPE = torch.float16
 QUANT_BITS = int(os.environ.get("FRAMEPACK_QUANT_BITS", "8"))
 USE_BITSANDBYTES = os.environ.get("FRAMEPACK_USE_BNB", "0") == "1"
 USE_FSDP = os.environ.get("FRAMEPACK_USE_FSDP", "0") == "1"
-OPTIMIZED_MODEL_PATH = os.environ.get(
-    "FRAMEPACK_OPTIMIZED_TRANSFORMER",
-    os.path.join(os.path.dirname(__file__), "optimized_models", "transformer_quantized.pt"),
-)
-OPTIMIZED_MODEL_DIR = os.path.dirname(OPTIMIZED_MODEL_PATH) or "."
-os.makedirs(OPTIMIZED_MODEL_DIR, exist_ok=True)
+ENABLE_QUANT = os.environ.get("FRAMEPACK_ENABLE_QUANT", "1") == "1"
+ENABLE_PRUNE = os.environ.get("FRAMEPACK_ENABLE_PRUNE", "1") == "1"
+ENABLE_OPT_CACHE = os.environ.get("FRAMEPACK_ENABLE_OPT_CACHE", "1") == "1"
+OPTIMIZED_MODEL_PATH = None
+if ENABLE_OPT_CACHE:
+    OPTIMIZED_MODEL_PATH = os.environ.get(
+        "FRAMEPACK_OPTIMIZED_TRANSFORMER",
+        os.path.join(os.path.dirname(__file__), "optimized_models", "transformer_quantized.pt"),
+    )
+    OPTIMIZED_MODEL_DIR = os.path.dirname(OPTIMIZED_MODEL_PATH) or "."
+    os.makedirs(OPTIMIZED_MODEL_DIR, exist_ok=True)
 bnb_config = None
 bnb_device_map = os.environ.get("FRAMEPACK_BNB_DEVICE_MAP", "auto")
 
@@ -131,22 +136,32 @@ text_encoder_2.eval()
 image_encoder.eval()
 transformer_core.eval()
 
-manual_quant_targets = [vae, image_encoder]
-if not USE_BITSANDBYTES:
-    manual_quant_targets.extend([text_encoder, text_encoder_2])
-if not optimized_transformer_loaded:
-    manual_quant_targets.append(transformer_core)
+if ENABLE_QUANT:
+    manual_quant_targets = [vae, image_encoder]
+    if not USE_BITSANDBYTES:
+        manual_quant_targets.extend([text_encoder, text_encoder_2])
+    if not optimized_transformer_loaded:
+        manual_quant_targets.append(transformer_core)
 
-for module in manual_quant_targets:
-    apply_int_nbit_quantization(module, num_bits=QUANT_BITS, target_dtype=MODEL_COMPUTE_DTYPE)
-    enforce_low_precision(module, activation_dtype=MODEL_COMPUTE_DTYPE)
+    for module in manual_quant_targets:
+        apply_int_nbit_quantization(module, num_bits=QUANT_BITS, target_dtype=MODEL_COMPUTE_DTYPE)
+        enforce_low_precision(module, activation_dtype=MODEL_COMPUTE_DTYPE)
+else:
+    print('FRAMEPACK_ENABLE_QUANT=0 -> skipping module quantization.')
+    for module in (vae, image_encoder, transformer_core):
+        enforce_low_precision(module, activation_dtype=MODEL_COMPUTE_DTYPE)
+    if not USE_BITSANDBYTES:
+        enforce_low_precision(text_encoder, activation_dtype=MODEL_COMPUTE_DTYPE)
+        enforce_low_precision(text_encoder_2, activation_dtype=MODEL_COMPUTE_DTYPE)
 
-if not optimized_transformer_loaded:
+if ENABLE_PRUNE and not optimized_transformer_loaded:
     prune_transformer_layers(
         transformer_core,
         dual_keep_ratio=float(os.environ.get("FRAMEPACK_PRUNE_DUAL_RATIO", 0.5)),
         single_keep_ratio=float(os.environ.get("FRAMEPACK_PRUNE_SINGLE_RATIO", 0.5)),
     )
+elif not ENABLE_PRUNE:
+    print('FRAMEPACK_ENABLE_PRUNE=0 -> skipping transformer pruning.')
 else:
     print('Transformer already optimized; skipping additional pruning.')
 
@@ -154,7 +169,7 @@ transformer_core.enable_gradient_checkpointing()
 transformer_core.high_quality_fp32_output_for_inference = False
 print('transformer.high_quality_fp32_output_for_inference = False')
 
-if not optimized_transformer_loaded and OPTIMIZED_MODEL_PATH:
+if ENABLE_OPT_CACHE and not optimized_transformer_loaded and OPTIMIZED_MODEL_PATH:
     torch.save(transformer_core, OPTIMIZED_MODEL_PATH)
     print(f'Saved optimized transformer weights to {OPTIMIZED_MODEL_PATH}')
 
