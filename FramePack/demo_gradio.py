@@ -71,6 +71,12 @@ MODEL_COMPUTE_DTYPE = torch.float16
 QUANT_BITS = int(os.environ.get("FRAMEPACK_QUANT_BITS", "8"))
 USE_BITSANDBYTES = os.environ.get("FRAMEPACK_USE_BNB", "0") == "1"
 USE_FSDP = os.environ.get("FRAMEPACK_USE_FSDP", "0") == "1"
+OPTIMIZED_MODEL_PATH = os.environ.get(
+    "FRAMEPACK_OPTIMIZED_TRANSFORMER",
+    os.path.join(os.path.dirname(__file__), "optimized_models", "transformer_quantized.pt"),
+)
+OPTIMIZED_MODEL_DIR = os.path.dirname(OPTIMIZED_MODEL_PATH) or "."
+os.makedirs(OPTIMIZED_MODEL_DIR, exist_ok=True)
 bnb_config = None
 bnb_device_map = os.environ.get("FRAMEPACK_BNB_DEVICE_MAP", "auto")
 
@@ -111,7 +117,13 @@ vae = AutoencoderKLHunyuanVideo.from_pretrained("hunyuanvideo-community/HunyuanV
 feature_extractor = SiglipImageProcessor.from_pretrained("lllyasviel/flux_redux_bfl", subfolder='feature_extractor')
 image_encoder = SiglipVisionModel.from_pretrained("lllyasviel/flux_redux_bfl", subfolder='image_encoder', torch_dtype=torch.float16).cpu()
 
-transformer_core = HunyuanVideoTransformer3DModelPacked.from_pretrained('lllyasviel/FramePackI2V_HY', torch_dtype=torch.bfloat16).cpu()
+optimized_transformer_loaded = False
+if OPTIMIZED_MODEL_PATH and os.path.isfile(OPTIMIZED_MODEL_PATH):
+    transformer_core = torch.load(OPTIMIZED_MODEL_PATH, map_location='cpu')
+    optimized_transformer_loaded = True
+    print(f'Loaded optimized transformer weights from {OPTIMIZED_MODEL_PATH}')
+else:
+    transformer_core = HunyuanVideoTransformer3DModelPacked.from_pretrained('lllyasviel/FramePackI2V_HY', torch_dtype=torch.bfloat16).cpu()
 
 vae.eval()
 text_encoder.eval()
@@ -119,22 +131,32 @@ text_encoder_2.eval()
 image_encoder.eval()
 transformer_core.eval()
 
-manual_quant_targets = [vae, image_encoder, transformer_core]
+manual_quant_targets = [vae, image_encoder]
 if not USE_BITSANDBYTES:
     manual_quant_targets.extend([text_encoder, text_encoder_2])
+if not optimized_transformer_loaded:
+    manual_quant_targets.append(transformer_core)
 
 for module in manual_quant_targets:
     apply_int_nbit_quantization(module, num_bits=QUANT_BITS, target_dtype=MODEL_COMPUTE_DTYPE)
     enforce_low_precision(module, activation_dtype=MODEL_COMPUTE_DTYPE)
 
-prune_transformer_layers(
-    transformer_core,
-    dual_keep_ratio=float(os.environ.get("FRAMEPACK_PRUNE_DUAL_RATIO", 0.5)),
-    single_keep_ratio=float(os.environ.get("FRAMEPACK_PRUNE_SINGLE_RATIO", 0.5)),
-)
+if not optimized_transformer_loaded:
+    prune_transformer_layers(
+        transformer_core,
+        dual_keep_ratio=float(os.environ.get("FRAMEPACK_PRUNE_DUAL_RATIO", 0.5)),
+        single_keep_ratio=float(os.environ.get("FRAMEPACK_PRUNE_SINGLE_RATIO", 0.5)),
+    )
+else:
+    print('Transformer already optimized; skipping additional pruning.')
+
 transformer_core.enable_gradient_checkpointing()
 transformer_core.high_quality_fp32_output_for_inference = False
 print('transformer.high_quality_fp32_output_for_inference = False')
+
+if not optimized_transformer_loaded and OPTIMIZED_MODEL_PATH:
+    torch.save(transformer_core, OPTIMIZED_MODEL_PATH)
+    print(f'Saved optimized transformer weights to {OPTIMIZED_MODEL_PATH}')
 
 transformer = maybe_wrap_with_fsdp(transformer_core, compute_dtype=MODEL_COMPUTE_DTYPE)
 TRANSFORMER_BACKBONE = transformer_core

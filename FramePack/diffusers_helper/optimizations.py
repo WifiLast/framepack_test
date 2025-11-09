@@ -63,6 +63,9 @@ class _QuantizedLayerBase(nn.Module):
         self._int4_padding = 0
 
     def _quantize_weight(self, weight: torch.Tensor, axis: int = 0) -> None:
+        if axis != 0:
+            raise NotImplementedError("Only axis=0 quantization is supported.")
+
         self._weight_shape = tuple(weight.shape)
         scale = _prepare_scale(weight, self.num_bits, axis=axis)
         scale = torch.where(scale == 0, torch.ones_like(scale), scale)
@@ -73,14 +76,26 @@ class _QuantizedLayerBase(nn.Module):
         qmin = -(1 << (self.num_bits - 1))
         qmax = (1 << (self.num_bits - 1)) - 1
 
-        qtensor = torch.clamp(torch.round(weight / scale_view), qmin, qmax).to(torch.int8)
+        flat_weight = weight.reshape(weight.shape[0], -1)
+        flat_scale = scale_view.reshape(scale_view_shape[0], -1)
+        qtensor_flat = torch.empty_like(flat_weight, dtype=torch.int8)
+
+        for idx in range(flat_weight.shape[0]):
+            row = flat_weight[idx]
+            row_scale = flat_scale[idx]
+            row.div_(row_scale)
+            row.round_()
+            row.clamp_(qmin, qmax)
+            qtensor_flat[idx].copy_(row.to(torch.int8))
+
+        qtensor = qtensor_flat.view(self._weight_shape).contiguous()
 
         if self.num_bits == 4:
             packed, padding = _pack_int4_tensor(qtensor)
             self.register_buffer("weight_q", packed)
             self._int4_padding = padding
         else:
-            self.register_buffer("weight_q", qtensor.contiguous())
+            self.register_buffer("weight_q", qtensor)
 
         self.register_buffer("weight_scale", scale)
 
@@ -99,14 +114,15 @@ class QuantizedLinear(_QuantizedLayerBase):
         super().__init__(num_bits=num_bits, target_dtype=target_dtype)
         self.in_features = module.in_features
         self.out_features = module.out_features
-        self.bias = None
         if module.bias is not None:
-            self.register_buffer("bias", module.bias.detach().to(target_dtype))
+            self.register_buffer("bias_q", module.bias.detach().to(target_dtype))
+        else:
+            self.bias_q = None
         self._quantize_weight(module.weight.detach(), axis=0)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         weight = self._dequantize_weight()
-        bias = None if self.bias is None else self.bias.to(dtype=self.target_dtype, device=x.device)
+        bias = None if self.bias_q is None else self.bias_q.to(dtype=self.target_dtype, device=x.device)
         return F.linear(x.to(self.target_dtype), weight, bias)
 
 
@@ -117,9 +133,10 @@ class _QuantizedConvNd(_QuantizedLayerBase):
         self.padding = module.padding
         self.dilation = module.dilation
         self.groups = module.groups
-        self.bias = None
         if module.bias is not None:
-            self.register_buffer("bias", module.bias.detach().to(target_dtype))
+            self.register_buffer("bias_q", module.bias.detach().to(target_dtype))
+        else:
+            self.bias_q = None
         self._quantize_weight(module.weight.detach(), axis=0)
 
     def _run_conv(self, x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor):
@@ -127,7 +144,7 @@ class _QuantizedConvNd(_QuantizedLayerBase):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         weight = self._dequantize_weight()
-        bias = None if self.bias is None else self.bias.to(dtype=self.target_dtype, device=x.device)
+        bias = None if self.bias_q is None else self.bias_q.to(dtype=self.target_dtype, device=x.device)
         return self._run_conv(x.to(self.target_dtype), weight, bias)
 
 
