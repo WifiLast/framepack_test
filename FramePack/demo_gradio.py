@@ -719,6 +719,7 @@ parser.add_argument("--cache-mode", type=str, choices=['hash', 'semantic', 'off'
 parser.add_argument("--jit-mode", type=str, choices=['off', 'trace', 'script'], default=os.environ.get("FRAMEPACK_JIT_MODE", "off"))
 parser.add_argument("--disable-fbcache", action='store_true')
 parser.add_argument("--disable-sim-cache", action='store_true')
+parser.add_argument("--disable-kv-cache", action='store_true')
 args = parser.parse_args()
 
 # for win desktop probably use --server 127.0.0.1 --inbrowser
@@ -759,6 +760,9 @@ SIM_CACHE_MAX_SKIP = int(os.environ.get("FRAMEPACK_SIM_CACHE_MAX_SKIP", "1"))
 SIM_CACHE_MAX_ENTRIES = int(os.environ.get("FRAMEPACK_SIM_CACHE_MAX_ENTRIES", "12"))
 SIM_CACHE_USE_FAISS = os.environ.get("FRAMEPACK_SIM_CACHE_USE_FAISS", "0") == "1"
 SIM_CACHE_VERBOSE = os.environ.get("FRAMEPACK_SIM_CACHE_VERBOSE", "0") == "1"
+ENABLE_KV_CACHE = (os.environ.get("FRAMEPACK_ENABLE_KV_CACHE", "0") == "1") and not args.disable_kv_cache
+KV_CACHE_LENGTH = int(os.environ.get("FRAMEPACK_KV_CACHE_LEN", "4096"))
+KV_CACHE_VERBOSE = os.environ.get("FRAMEPACK_KV_CACHE_VERBOSE", "0") == "1"
 
 free_mem_gb = get_cuda_free_memory_gb(gpu)
 high_vram = free_mem_gb > 60
@@ -964,6 +968,16 @@ if ENABLE_SIM_CACHE:
     )
 else:
     transformer_core.enable_similarity_cache(enabled=False)
+
+if ENABLE_KV_CACHE:
+    transformer_core.enable_kv_cache(
+        enabled=True,
+        max_length=KV_CACHE_LENGTH,
+        verbose=KV_CACHE_VERBOSE,
+    )
+    print(f'KV cache enabled (max length={KV_CACHE_LENGTH}).')
+else:
+    transformer_core.enable_kv_cache(enabled=False)
 
 if ENABLE_QUANT:
     manual_quant_targets = [vae, image_encoder]

@@ -24,6 +24,10 @@ from .similarity_cache import (
     SimilarityCacheConfig,
     SimilarityCacheManager,
 )
+from .kv_cache import (
+    KVCachingConfig,
+    KVCachingManager,
+)
 
 ensure_torchvision_compat()
 
@@ -46,4 +50,6 @@ __all__ = [
     "LearnableProjector",
     "SimilarityCacheConfig",
     "SimilarityCacheManager",
+    "KVCachingConfig",
+    "KVCachingManager",
 ]

@@ -22,6 +22,10 @@ from diffusers_helper.similarity_cache import (
     SimilarityCacheConfig,
     SimilarityCacheManager,
 )
+from diffusers_helper.kv_cache import (
+    KVCachingConfig,
+    KVCachingManager,
+)
 
 
 enabled_backends = []
@@ -810,6 +814,8 @@ class HunyuanVideoTransformer3DModelPacked(ModelMixin, ConfigMixin, PeftAdapterM
         self._sim_cache_hit_streak_single: list[int] = []
         self._sim_cache_stats = {"hits": 0, "queries": 0}
         self._sim_cache_step = 0
+        self.enable_kv_cache = False
+        self.kv_cache_manager: Optional[KVCachingManager] = None
 
         if has_image_proj:
             self.install_image_projection(image_proj_dim)
@@ -876,6 +882,27 @@ class HunyuanVideoTransformer3DModelPacked(ModelMixin, ConfigMixin, PeftAdapterM
         )
         self._sim_cache_hit_streak_dual = [0] * len(self.transformer_blocks)
         self._sim_cache_hit_streak_single = [0] * len(self.single_transformer_blocks)
+
+    def enable_kv_cache(
+        self,
+        *,
+        enabled: bool = True,
+        max_length: int = 2048,
+        reset_on_mismatch: bool = True,
+        verbose: bool = False,
+    ):
+        if not enabled:
+            self.enable_kv_cache = False
+            self.kv_cache_manager = None
+            return
+        config = KVCachingConfig(
+            enabled=True,
+            max_length=max_length,
+            reset_on_mismatch=reset_on_mismatch,
+            verbose=verbose,
+        )
+        self.kv_cache_manager = KVCachingManager(config)
+        self.enable_kv_cache = True
 
     def install_image_projection(self, in_channels):
         self.image_projection = ClipVisionProjection(in_channels=in_channels, out_channels=self.inner_dim)
