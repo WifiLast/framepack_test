@@ -19,6 +19,11 @@ from .fbcache import (
     FirstBlockCache,
     FirstBlockCacheConfig,
 )
+from .similarity_cache import (
+    LearnableProjector,
+    SimilarityCacheConfig,
+    SimilarityCacheManager,
+)
 
 ensure_torchvision_compat()
 
@@ -38,4 +43,7 @@ __all__ = [
     "optimized_resize_and_center_crop",
     "FirstBlockCache",
     "FirstBlockCacheConfig",
+    "LearnableProjector",
+    "SimilarityCacheConfig",
+    "SimilarityCacheManager",
 ]

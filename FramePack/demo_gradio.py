@@ -718,6 +718,7 @@ parser.add_argument("--inbrowser", action='store_true')
 parser.add_argument("--cache-mode", type=str, choices=['hash', 'semantic', 'off'], default=DEFAULT_CACHE_MODE)
 parser.add_argument("--jit-mode", type=str, choices=['off', 'trace', 'script'], default=os.environ.get("FRAMEPACK_JIT_MODE", "off"))
 parser.add_argument("--disable-fbcache", action='store_true')
+parser.add_argument("--disable-sim-cache", action='store_true')
 args = parser.parse_args()
 
 # for win desktop probably use --server 127.0.0.1 --inbrowser
@@ -752,6 +753,12 @@ if CPU_PREPROCESS_ACCEL:
 ENABLE_FBCACHE = (os.environ.get("FRAMEPACK_ENABLE_FBCACHE", "1") == "1") and not args.disable_fbcache
 FBCACHE_THRESHOLD = float(os.environ.get("FRAMEPACK_FBCACHE_THRESHOLD", "0.035"))
 FBCACHE_VERBOSE = os.environ.get("FRAMEPACK_FBCACHE_VERBOSE", "0") == "1"
+ENABLE_SIM_CACHE = (os.environ.get("FRAMEPACK_ENABLE_SIM_CACHE", "0") == "1") and not args.disable_sim_cache
+SIM_CACHE_THRESHOLD = float(os.environ.get("FRAMEPACK_SIM_CACHE_THRESHOLD", "0.9"))
+SIM_CACHE_MAX_SKIP = int(os.environ.get("FRAMEPACK_SIM_CACHE_MAX_SKIP", "1"))
+SIM_CACHE_MAX_ENTRIES = int(os.environ.get("FRAMEPACK_SIM_CACHE_MAX_ENTRIES", "12"))
+SIM_CACHE_USE_FAISS = os.environ.get("FRAMEPACK_SIM_CACHE_USE_FAISS", "0") == "1"
+SIM_CACHE_VERBOSE = os.environ.get("FRAMEPACK_SIM_CACHE_VERBOSE", "0") == "1"
 
 free_mem_gb = get_cuda_free_memory_gb(gpu)
 high_vram = free_mem_gb > 60
@@ -761,7 +768,7 @@ print(f'High-VRAM Mode: {high_vram}')
 QUANT_BITS = int(os.environ.get("FRAMEPACK_QUANT_BITS", "8"))
 USE_BITSANDBYTES = os.environ.get("FRAMEPACK_USE_BNB", "0") == "1"
 USE_FSDP = os.environ.get("FRAMEPACK_USE_FSDP", "0") == "1"
-ENABLE_QUANT = os.environ.get("FRAMEPACK_ENABLE_QUANT", "1") == "1"
+ENABLE_QUANT = os.environ.get("FRAMEPACK_ENABLE_QUANT", "0") == "1"
 ENABLE_PRUNE = os.environ.get("FRAMEPACK_ENABLE_PRUNE", "1") == "1"
 ENABLE_OPT_CACHE = os.environ.get("FRAMEPACK_ENABLE_OPT_CACHE", "1") == "1"
 ENABLE_MODULE_CACHE = os.environ.get("FRAMEPACK_ENABLE_MODULE_CACHE", "1") == "1"
@@ -941,6 +948,22 @@ if ENABLE_FBCACHE:
     print(f'First block cache enabled (threshold={FBCACHE_THRESHOLD:.4f}).')
 else:
     transformer_core.enable_first_block_cache(enabled=False)
+
+if ENABLE_SIM_CACHE:
+    transformer_core.enable_similarity_cache(
+        enabled=True,
+        threshold=SIM_CACHE_THRESHOLD,
+        max_skip=SIM_CACHE_MAX_SKIP,
+        max_entries=SIM_CACHE_MAX_ENTRIES,
+        use_faiss=SIM_CACHE_USE_FAISS,
+        verbose=SIM_CACHE_VERBOSE,
+    )
+    print(
+        f'Similarity cache enabled (threshold={SIM_CACHE_THRESHOLD:.3f}, '
+        f'max_skip={SIM_CACHE_MAX_SKIP}, entries={SIM_CACHE_MAX_ENTRIES}).'
+    )
+else:
+    transformer_core.enable_similarity_cache(enabled=False)
 
 if ENABLE_QUANT:
     manual_quant_targets = [vae, image_encoder]

@@ -83,6 +83,7 @@ FramePack ships with an inference-focused execution engine. Models are always sw
 - Tensor-core alignment factors can be tuned through `FRAMEPACK_TENSORCORE_MULT_FP16` and `FRAMEPACK_TENSORCORE_MULT_TF32`. Batch replication for small batches can be managed via `FRAMEPACK_MIN_BATCH`.
 - CPU-side preprocessing (image resizing + normalization) can use SIMD/OpenCV + oneDAL pipelines by default. Disable with `FRAMEPACK_CPU_OPT=0` or control thread count via `FRAMEPACK_CPU_OPT_THREADS=<n>`.
 - First-block caching (FBCache) avoids recomputing the heavy portion of the transformer when inputs barely change. Disable via `--disable-fbcache` or `FRAMEPACK_ENABLE_FBCACHE=0`, tune the reuse threshold with `FRAMEPACK_FBCACHE_THRESHOLD=0.035`, and enable logging via `FRAMEPACK_FBCACHE_VERBOSE=1`.
+- The similarity/alignment cache reuses transformer activations for highly similar inputs (e.g., adjacent frames). Toggle with `--disable-sim-cache` or `FRAMEPACK_ENABLE_SIM_CACHE`, configure the cosine threshold (`FRAMEPACK_SIM_CACHE_THRESHOLD`, default `0.9`), max consecutive skips (`FRAMEPACK_SIM_CACHE_MAX_SKIP`), cache size (`FRAMEPACK_SIM_CACHE_MAX_ENTRIES`), and optional FAISS-based lookup (`FRAMEPACK_SIM_CACHE_USE_FAISS=1`).
 
 These knobs keep inference paths deterministic while allowing you to trade build time for runtime performance when deploying on constrained GPUs or exporting TorchScript modules.
 

@@ -17,6 +17,11 @@ from diffusers.models.modeling_utils import ModelMixin
 from diffusers_helper.dit_common import LayerNorm
 from diffusers_helper.utils import zero_module
 from diffusers_helper.fbcache import FirstBlockCache, FirstBlockCacheConfig
+from diffusers_helper.similarity_cache import (
+    LearnableProjector,
+    SimilarityCacheConfig,
+    SimilarityCacheManager,
+)
 
 
 enabled_backends = []
@@ -796,6 +801,15 @@ class HunyuanVideoTransformer3DModelPacked(ModelMixin, ConfigMixin, PeftAdapterM
         self.enable_teacache = False
         self.enable_fbcache = False
         self.first_block_cache: Optional[FirstBlockCache] = None
+        self.enable_similarity_cache = False
+        self.similarity_cache_config: Optional[SimilarityCacheConfig] = None
+        self.similarity_cache_manager: Optional[SimilarityCacheManager] = None
+        self.similarity_projectors_dual: Optional[nn.ModuleList] = None
+        self.similarity_projectors_single: Optional[nn.ModuleList] = None
+        self._sim_cache_hit_streak_dual: list[int] = []
+        self._sim_cache_hit_streak_single: list[int] = []
+        self._sim_cache_stats = {"hits": 0, "queries": 0}
+        self._sim_cache_step = 0
 
         if has_image_proj:
             self.install_image_projection(image_proj_dim)
@@ -817,6 +831,51 @@ class HunyuanVideoTransformer3DModelPacked(ModelMixin, ConfigMixin, PeftAdapterM
             self.enable_fbcache = False
             if self.first_block_cache is not None:
                 self.first_block_cache.reset()
+
+    def enable_similarity_cache(
+        self,
+        *,
+        enabled: bool = True,
+        threshold: float = 0.9,
+        max_skip: int = 1,
+        max_entries: int = 16,
+        use_faiss: bool = False,
+        verbose: bool = False,
+    ):
+        if not enabled:
+            self.enable_similarity_cache = False
+            self.similarity_cache_manager = None
+            self.similarity_projectors_dual = None
+            self.similarity_projectors_single = None
+            self._sim_cache_hit_streak_dual = []
+            self._sim_cache_hit_streak_single = []
+            return
+
+        threshold = float(max(1e-5, threshold))
+        config = SimilarityCacheConfig(
+            enabled=True,
+            threshold=threshold,
+            max_skip=max(1, int(max_skip)),
+            max_entries=max(1, int(max_entries)),
+            use_faiss=use_faiss,
+            verbose=verbose,
+        )
+        self.enable_similarity_cache = True
+        self.similarity_cache_config = config
+        self.similarity_cache_manager = SimilarityCacheManager(
+            len(self.transformer_blocks),
+            len(self.single_transformer_blocks),
+            self.inner_dim,
+            config,
+        )
+        self.similarity_projectors_dual = nn.ModuleList(
+            [LearnableProjector(self.inner_dim) for _ in range(len(self.transformer_blocks))]
+        )
+        self.similarity_projectors_single = nn.ModuleList(
+            [LearnableProjector(self.inner_dim) for _ in range(len(self.single_transformer_blocks))]
+        )
+        self._sim_cache_hit_streak_dual = [0] * len(self.transformer_blocks)
+        self._sim_cache_hit_streak_single = [0] * len(self.single_transformer_blocks)
 
     def install_image_projection(self, in_channels):
         self.image_projection = ClipVisionProjection(in_channels=in_channels, out_channels=self.inner_dim)
@@ -1026,23 +1085,27 @@ class HunyuanVideoTransformer3DModelPacked(ModelMixin, ConfigMixin, PeftAdapterM
                 )
             else:
                 for block_id, block in enumerate(self.transformer_blocks):
-                    hidden_states, encoder_hidden_states = self.gradient_checkpointing_method(
-                        block,
-                        hidden_states,
-                        encoder_hidden_states,
-                        temb,
-                        attention_mask,
-                        rope_freqs
+                    hidden_states, encoder_hidden_states = self._apply_block_with_similarity_cache(
+                        block=block,
+                        block_type="dual",
+                        block_id=block_id,
+                        hidden_states=hidden_states,
+                        encoder_hidden_states=encoder_hidden_states,
+                        temb=temb,
+                        attention_mask=attention_mask,
+                        rope_freqs=rope_freqs,
                     )
 
                 for block_id, block in enumerate(self.single_transformer_blocks):
-                    hidden_states, encoder_hidden_states = self.gradient_checkpointing_method(
-                        block,
-                        hidden_states,
-                        encoder_hidden_states,
-                        temb,
-                        attention_mask,
-                        rope_freqs
+                    hidden_states, encoder_hidden_states = self._apply_block_with_similarity_cache(
+                        block=block,
+                        block_type="single",
+                        block_id=block_id,
+                        hidden_states=hidden_states,
+                        encoder_hidden_states=encoder_hidden_states,
+                        temb=temb,
+                        attention_mask=attention_mask,
+                        rope_freqs=rope_freqs,
                     )
 
         hidden_states = self.gradient_checkpointing_method(self.norm_out, hidden_states, temb)
@@ -1064,3 +1127,151 @@ class HunyuanVideoTransformer3DModelPacked(ModelMixin, ConfigMixin, PeftAdapterM
             return Transformer2DModelOutput(sample=hidden_states)
 
         return hidden_states,
+
+    def _should_use_similarity_cache(self, hidden_states: torch.Tensor) -> bool:
+        if not self.enable_similarity_cache or self.similarity_cache_manager is None:
+            return False
+        if torch.is_grad_enabled():
+            return False
+        if hidden_states.shape[0] != 1:
+            return False
+        return True
+
+    def _apply_block_with_similarity_cache(
+        self,
+        *,
+        block,
+        block_type: str,
+        block_id: int,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: Optional[torch.Tensor],
+        temb: torch.Tensor,
+        attention_mask,
+        rope_freqs,
+    ):
+        if not self._should_use_similarity_cache(hidden_states):
+            hidden_states, encoder_hidden_states = self._execute_block(
+                block,
+                hidden_states,
+                encoder_hidden_states,
+                temb,
+                attention_mask,
+                rope_freqs,
+            )
+            self._update_similarity_cache(
+                block_type=block_type,
+                block_id=block_id,
+                hidden_states=hidden_states,
+                encoder_hidden_states=encoder_hidden_states,
+            )
+            return hidden_states, encoder_hidden_states
+
+        cache = self.similarity_cache_manager.get(block_type, block_id)
+        projector_list = (
+            self.similarity_projectors_dual if block_type == "dual" else self.similarity_projectors_single
+        )
+        streaks = (
+            self._sim_cache_hit_streak_dual if block_type == "dual" else self._sim_cache_hit_streak_single
+        )
+        key = self._compute_sim_cache_key(hidden_states, encoder_hidden_states)
+        hit = cache.lookup(key)
+        self._sim_cache_stats["queries"] += 1
+        reuse = False
+        sim_score = 0.0
+        entry = None
+
+        if hit is not None:
+            entry, sim_score = hit
+            if (
+                sim_score >= self.similarity_cache_config.threshold
+                and streaks[block_id] < self.similarity_cache_config.max_skip
+                and projector_list is not None
+            ):
+                reuse = True
+
+        if reuse and projector_list is not None:
+            streaks[block_id] += 1
+            self._sim_cache_stats["hits"] += 1
+            sim_tensor = hidden_states.new_tensor(sim_score)
+            cached_hidden = entry.hidden.to(device=hidden_states.device, dtype=hidden_states.dtype)
+            projected_hidden = projector_list[block_id](cached_hidden, sim_tensor)
+            if encoder_hidden_states is not None and entry.encoder is not None:
+                cached_encoder = entry.encoder.to(device=encoder_hidden_states.device, dtype=encoder_hidden_states.dtype)
+                projected_encoder = projector_list[block_id](cached_encoder, sim_tensor)
+            else:
+                projected_encoder = encoder_hidden_states
+            return projected_hidden, projected_encoder
+
+        hidden_states, encoder_hidden_states = self._execute_block(
+            block,
+            hidden_states,
+            encoder_hidden_states,
+            temb,
+            attention_mask,
+            rope_freqs,
+        )
+        streaks[block_id] = 0
+        self._update_similarity_cache(
+            block_type=block_type,
+            block_id=block_id,
+            hidden_states=hidden_states,
+            encoder_hidden_states=encoder_hidden_states,
+            key=key,
+        )
+        return hidden_states, encoder_hidden_states
+
+    def _execute_block(
+        self,
+        block,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: Optional[torch.Tensor],
+        temb: torch.Tensor,
+        attention_mask,
+        rope_freqs,
+    ):
+        return self.gradient_checkpointing_method(
+            block,
+            hidden_states,
+            encoder_hidden_states,
+            temb,
+            attention_mask,
+            rope_freqs,
+        )
+
+    def _update_similarity_cache(
+        self,
+        *,
+        block_type: str,
+        block_id: int,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: Optional[torch.Tensor],
+        key: Optional[torch.Tensor] = None,
+    ):
+        if not self.enable_similarity_cache or self.similarity_cache_manager is None:
+            return
+        if key is None:
+            key = self._compute_sim_cache_key(hidden_states, encoder_hidden_states)
+        self.similarity_cache_manager.step()
+        cache = self.similarity_cache_manager.get(block_type, block_id)
+        cache.update(key, hidden_states, encoder_hidden_states, self.similarity_cache_manager.global_step)
+        self.similarity_cache_manager.prune()
+
+    def _compute_sim_cache_key(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        def _pool(tensor: torch.Tensor) -> torch.Tensor:
+            pooled = tensor.float()
+            while pooled.dim() > 2:
+                pooled = pooled.mean(dim=1)
+            pooled = pooled.view(pooled.shape[0], -1)
+            return pooled[0]
+
+        key = _pool(hidden_states)
+        if encoder_hidden_states is not None:
+            enc = _pool(encoder_hidden_states)
+            min_dim = min(key.shape[0], enc.shape[0])
+            key = key.clone()
+            key[:min_dim] = key[:min_dim] + 0.1 * enc[:min_dim]
+        return key
