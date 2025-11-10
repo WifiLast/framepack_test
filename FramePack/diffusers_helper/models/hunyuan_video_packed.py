@@ -824,7 +824,7 @@ class HunyuanVideoTransformer3DModelPacked(ModelMixin, ConfigMixin, PeftAdapterM
         self.enable_teacache = False
         self.enable_fbcache = False
         self.first_block_cache: Optional[FirstBlockCache] = None
-        self.enable_similarity_cache = False
+        self.similarity_cache_enabled = False
         self.similarity_cache_config: Optional[SimilarityCacheConfig] = None
         self.similarity_cache_manager: Optional[SimilarityCacheManager] = None
         self.similarity_projectors_dual: Optional[nn.ModuleList] = None
@@ -868,7 +868,7 @@ class HunyuanVideoTransformer3DModelPacked(ModelMixin, ConfigMixin, PeftAdapterM
         verbose: bool = False,
     ):
         if not enabled:
-            self.enable_similarity_cache = False
+            self.similarity_cache_enabled = False
             self.similarity_cache_manager = None
             self.similarity_projectors_dual = None
             self.similarity_projectors_single = None
@@ -885,7 +885,7 @@ class HunyuanVideoTransformer3DModelPacked(ModelMixin, ConfigMixin, PeftAdapterM
             use_faiss=use_faiss,
             verbose=verbose,
         )
-        self.enable_similarity_cache = True
+        self.similarity_cache_enabled = True
         self.similarity_cache_config = config
         self.similarity_cache_manager = SimilarityCacheManager(
             len(self.transformer_blocks),
@@ -1175,7 +1175,7 @@ class HunyuanVideoTransformer3DModelPacked(ModelMixin, ConfigMixin, PeftAdapterM
         return hidden_states,
 
     def _should_use_similarity_cache(self, hidden_states: torch.Tensor) -> bool:
-        if not self.enable_similarity_cache or self.similarity_cache_manager is None:
+        if not self.similarity_cache_enabled or self.similarity_cache_manager is None:
             return False
         if torch.is_grad_enabled():
             return False
@@ -1293,7 +1293,7 @@ class HunyuanVideoTransformer3DModelPacked(ModelMixin, ConfigMixin, PeftAdapterM
         encoder_hidden_states: Optional[torch.Tensor],
         key: Optional[torch.Tensor] = None,
     ):
-        if not self.enable_similarity_cache or self.similarity_cache_manager is None:
+        if not self.similarity_cache_enabled or self.similarity_cache_manager is None:
             return
         if key is None:
             key = self._compute_sim_cache_key(hidden_states, encoder_hidden_states)

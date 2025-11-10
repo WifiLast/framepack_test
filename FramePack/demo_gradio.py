@@ -23,7 +23,7 @@ from typing import Any, Dict, List, Sequence, Tuple
 import torch.nn.functional as F
 
 from PIL import Image
-#from diffusers import AutoencoderKLHunyuanVideo
+from diffusers import AutoencoderKLHunyuanVideo
 from transformers import (
     LlamaModel,
     CLIPTextModel,
