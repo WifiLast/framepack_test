@@ -15,6 +15,10 @@ from .cpu_opt import (
     normalize_uint8_image,
     optimized_resize_and_center_crop,
 )
+from .fbcache import (
+    FirstBlockCache,
+    FirstBlockCacheConfig,
+)
 
 ensure_torchvision_compat()
 
@@ -32,4 +36,6 @@ __all__ = [
     "cpu_preprocessing_active",
     "normalize_uint8_image",
     "optimized_resize_and_center_crop",
+    "FirstBlockCache",
+    "FirstBlockCacheConfig",
 ]

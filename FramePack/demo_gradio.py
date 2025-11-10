@@ -717,6 +717,7 @@ parser.add_argument("--port", type=int, required=False)
 parser.add_argument("--inbrowser", action='store_true')
 parser.add_argument("--cache-mode", type=str, choices=['hash', 'semantic', 'off'], default=DEFAULT_CACHE_MODE)
 parser.add_argument("--jit-mode", type=str, choices=['off', 'trace', 'script'], default=os.environ.get("FRAMEPACK_JIT_MODE", "off"))
+parser.add_argument("--disable-fbcache", action='store_true')
 args = parser.parse_args()
 
 # for win desktop probably use --server 127.0.0.1 --inbrowser
@@ -748,6 +749,9 @@ TENSOR_CORE_MULTIPLE = tensor_core_multiple_for_dtype(MODEL_COMPUTE_DTYPE, INFER
 CPU_PREPROCESS_ACCEL = cpu_preprocessing_active()
 if CPU_PREPROCESS_ACCEL:
     print('CPU-side preprocessing acceleration enabled (SIMD/OpenCV + oneDAL).')
+ENABLE_FBCACHE = (os.environ.get("FRAMEPACK_ENABLE_FBCACHE", "1") == "1") and not args.disable_fbcache
+FBCACHE_THRESHOLD = float(os.environ.get("FRAMEPACK_FBCACHE_THRESHOLD", "0.035"))
+FBCACHE_VERBOSE = os.environ.get("FRAMEPACK_FBCACHE_VERBOSE", "0") == "1"
 
 free_mem_gb = get_cuda_free_memory_gb(gpu)
 high_vram = free_mem_gb > 60
@@ -927,6 +931,16 @@ text_encoder.eval()
 text_encoder_2.eval()
 image_encoder.eval()
 transformer_core.eval()
+
+if ENABLE_FBCACHE:
+    transformer_core.enable_first_block_cache(
+        enabled=True,
+        threshold=FBCACHE_THRESHOLD,
+        verbose=FBCACHE_VERBOSE,
+    )
+    print(f'First block cache enabled (threshold={FBCACHE_THRESHOLD:.4f}).')
+else:
+    transformer_core.enable_first_block_cache(enabled=False)
 
 if ENABLE_QUANT:
     manual_quant_targets = [vae, image_encoder]

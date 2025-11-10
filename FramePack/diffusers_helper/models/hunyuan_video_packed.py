@@ -16,6 +16,7 @@ from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.modeling_utils import ModelMixin
 from diffusers_helper.dit_common import LayerNorm
 from diffusers_helper.utils import zero_module
+from diffusers_helper.fbcache import FirstBlockCache, FirstBlockCacheConfig
 
 
 enabled_backends = []
@@ -793,6 +794,8 @@ class HunyuanVideoTransformer3DModelPacked(ModelMixin, ConfigMixin, PeftAdapterM
         self.inner_dim = inner_dim
         self.use_gradient_checkpointing = False
         self.enable_teacache = False
+        self.enable_fbcache = False
+        self.first_block_cache: Optional[FirstBlockCache] = None
 
         if has_image_proj:
             self.install_image_projection(image_proj_dim)
@@ -801,6 +804,19 @@ class HunyuanVideoTransformer3DModelPacked(ModelMixin, ConfigMixin, PeftAdapterM
             self.install_clean_x_embedder()
 
         self.high_quality_fp32_output_for_inference = False
+
+    def enable_first_block_cache(self, *, enabled: bool = True, threshold: float = 0.03, verbose: bool = False):
+        if enabled:
+            config = FirstBlockCacheConfig(enabled=True, threshold=max(1e-5, float(threshold)), verbose=verbose)
+            if self.first_block_cache is None:
+                self.first_block_cache = FirstBlockCache(config)
+            else:
+                self.first_block_cache.update_config(config)
+            self.enable_fbcache = True
+        else:
+            self.enable_fbcache = False
+            if self.first_block_cache is not None:
+                self.first_block_cache.reset()
 
     def install_image_projection(self, in_channels):
         self.image_projection = ClipVisionProjection(in_channels=in_channels, out_channels=self.inner_dim)
@@ -996,25 +1012,38 @@ class HunyuanVideoTransformer3DModelPacked(ModelMixin, ConfigMixin, PeftAdapterM
 
                 self.previous_residual = hidden_states - ori_hidden_states
         else:
-            for block_id, block in enumerate(self.transformer_blocks):
-                hidden_states, encoder_hidden_states = self.gradient_checkpointing_method(
-                    block,
-                    hidden_states,
-                    encoder_hidden_states,
-                    temb,
-                    attention_mask,
-                    rope_freqs
+            use_fb_cache = self.enable_fbcache and self.first_block_cache is not None
+            if use_fb_cache:
+                hidden_states, encoder_hidden_states = self.first_block_cache.maybe_run(
+                    hidden_states=hidden_states,
+                    encoder_hidden_states=encoder_hidden_states,
+                    temb=temb,
+                    attention_mask=attention_mask,
+                    rope_freqs=rope_freqs,
+                    transformer_blocks=self.transformer_blocks,
+                    single_transformer_blocks=self.single_transformer_blocks,
+                    grad_ckpt_fn=self.gradient_checkpointing_method,
                 )
+            else:
+                for block_id, block in enumerate(self.transformer_blocks):
+                    hidden_states, encoder_hidden_states = self.gradient_checkpointing_method(
+                        block,
+                        hidden_states,
+                        encoder_hidden_states,
+                        temb,
+                        attention_mask,
+                        rope_freqs
+                    )
 
-            for block_id, block in enumerate(self.single_transformer_blocks):
-                hidden_states, encoder_hidden_states = self.gradient_checkpointing_method(
-                    block,
-                    hidden_states,
-                    encoder_hidden_states,
-                    temb,
-                    attention_mask,
-                    rope_freqs
-                )
+                for block_id, block in enumerate(self.single_transformer_blocks):
+                    hidden_states, encoder_hidden_states = self.gradient_checkpointing_method(
+                        block,
+                        hidden_states,
+                        encoder_hidden_states,
+                        temb,
+                        attention_mask,
+                        rope_freqs
+                    )
 
         hidden_states = self.gradient_checkpointing_method(self.norm_out, hidden_states, temb)
 
