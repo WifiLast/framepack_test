@@ -1389,9 +1389,20 @@ outputs_folder = './outputs/'
 os.makedirs(outputs_folder, exist_ok=True)
 
 
-def vae_decode_chunked(latents, vae, chunk_size=1):
-    """Decode latents in chunks to avoid OOM errors."""
+def vae_decode_chunked(latents, vae, chunk_size=1, quality_mode=False):
+    """Decode latents in chunks to avoid OOM errors.
+
+    Args:
+        latents: Latent tensors to decode
+        vae: VAE model
+        chunk_size: Number of latent frames to decode at once (1 = most memory-safe)
+        quality_mode: If True, use larger chunks (2-4) for better quality at cost of more VRAM
+    """
     b, c, t, h, w = latents.shape
+
+    # Adjust chunk size for quality mode
+    if quality_mode:
+        chunk_size = min(4, t)  # Use up to 4 frames for better quality
 
     if t <= chunk_size:
         # Small enough to decode at once
@@ -1399,7 +1410,7 @@ def vae_decode_chunked(latents, vae, chunk_size=1):
             result = vae_decode(latents, vae)
         return result.cpu()
 
-    # Decode in chunks - one frame at a time for extreme memory constraints
+    # Decode in chunks - balance between memory and quality
     chunks = []
     for i in range(0, t, chunk_size):
         end_idx = min(i + chunk_size, t)
@@ -1412,10 +1423,11 @@ def vae_decode_chunked(latents, vae, chunk_size=1):
         chunks.append(chunk_pixels.cpu())
         del chunk_pixels, chunk_latents
 
-        # Aggressive CUDA cache clearing after each chunk
+        # Clear cache after each chunk (less aggressive in quality mode)
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-            torch.cuda.synchronize()
+            if not quality_mode:
+                torch.cuda.synchronize()
 
     # Concatenate all chunks on CPU
     result = torch.cat(chunks, dim=2)
@@ -1429,7 +1441,7 @@ def vae_decode_chunked(latents, vae, chunk_size=1):
 
 
 @torch.inference_mode()
-def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, cache_mode, mp4_crf):
+def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, cache_mode, mp4_crf, quality_mode=False):
     runtime_cache_mode = (cache_mode or CACHE_MODE).lower()
     set_cache_mode_for_wrappers(runtime_cache_mode)
     latent_window_size = align_to_multiple(latent_window_size, multiple=8, minimum=8)
@@ -1676,12 +1688,12 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
                 torch.cuda.synchronize()
 
             if history_pixels is None:
-                history_pixels = vae_decode_chunked(real_history_latents, vae, chunk_size=1)
+                history_pixels = vae_decode_chunked(real_history_latents, vae, chunk_size=1, quality_mode=quality_mode)
             else:
                 section_latent_frames = (latent_window_size * 2 + 1) if is_last_section else (latent_window_size * 2)
                 overlapped_frames = latent_window_size * 4 - 3
 
-                current_pixels = vae_decode_chunked(real_history_latents[:, :, :section_latent_frames], vae, chunk_size=1)
+                current_pixels = vae_decode_chunked(real_history_latents[:, :, :section_latent_frames], vae, chunk_size=1, quality_mode=quality_mode)
                 history_pixels = soft_append_bcthw(current_pixels, history_pixels, overlapped_frames)
 
             if not high_vram:
@@ -1711,7 +1723,7 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
     return
 
 
-def process(input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, cache_mode, mp4_crf):
+def process(input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, cache_mode, mp4_crf, quality_mode):
     global stream
     assert input_image is not None, 'No input image!'
 
@@ -1719,7 +1731,7 @@ def process(input_image, prompt, n_prompt, seed, total_second_length, latent_win
 
     stream = AsyncStream()
 
-    async_run(worker, input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, cache_mode, mp4_crf)
+    async_run(worker, input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, cache_mode, mp4_crf, quality_mode)
 
     output_filename = None
 
@@ -1767,6 +1779,7 @@ with block:
 
             with gr.Group():
                 use_teacache = gr.Checkbox(label='Use TeaCache', value=True, info='Faster speed, but often makes hands and fingers slightly worse.')
+                quality_mode = gr.Checkbox(label='Quality Mode (Better Hands)', value=False, info='Uses larger VAE chunks (2-4 frames) for better quality, especially for hands. Requires more VRAM.')
                 cache_mode_selector = gr.Radio(
                     label='Cache Mode',
                     choices=['hash', 'semantic', 'off'],
@@ -1791,14 +1804,19 @@ with block:
 
         with gr.Column():
             preview_image = gr.Image(label="Next Latents", height=200, visible=False)
-            result_video = gr.Video(label="Finished Frames", autoplay=True, show_share_button=False, height=512, loop=True)
-            gr.Markdown('Note that the ending actions will be generated before the starting actions due to the inverted sampling. If the starting action is not in the video, you just need to wait, and it will be generated later.')
+            result_video = gr.Video(label="Finished Frames (30 FPS)", autoplay=True, show_share_button=False, height=512, loop=True)
+            gr.Markdown('''**Important Notes:**
+- Videos are rendered at 30 FPS (standard video framerate)
+- The ending actions are generated before starting actions (inverted sampling)
+- For better hand quality: Enable "Quality Mode" and disable "TeaCache"
+- If video appears too fast, reduce "Total Video Length" to generate more frames per second of content
+''')
             progress_desc = gr.Markdown('', elem_classes='no-generating-animation')
             progress_bar = gr.HTML('', elem_classes='no-generating-animation')
 
     gr.HTML('<div style="text-align:center; margin-top:20px;">Share your results and find ideas at the <a href="https://x.com/search?q=framepack&f=live" target="_blank">FramePack Twitter (X) thread</a></div>')
 
-    ips = [input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, cache_mode_selector, mp4_crf]
+    ips = [input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, cache_mode_selector, mp4_crf, quality_mode]
     start_button.click(fn=process, inputs=ips, outputs=[result_video, preview_image, progress_desc, progress_bar, start_button, end_button])
     end_button.click(fn=end_process)
 
