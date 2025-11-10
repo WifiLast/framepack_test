@@ -833,7 +833,7 @@ class HunyuanVideoTransformer3DModelPacked(ModelMixin, ConfigMixin, PeftAdapterM
         self._sim_cache_hit_streak_single: list[int] = []
         self._sim_cache_stats = {"hits": 0, "queries": 0}
         self._sim_cache_step = 0
-        self.enable_kv_cache = False
+        self.kv_cache_enabled = False
         self.kv_cache_manager: Optional[KVCachingManager] = None
 
         if has_image_proj:
@@ -911,7 +911,7 @@ class HunyuanVideoTransformer3DModelPacked(ModelMixin, ConfigMixin, PeftAdapterM
         verbose: bool = False,
     ):
         if not enabled:
-            self.enable_kv_cache = False
+            self.kv_cache_enabled = False
             self.kv_cache_manager = None
             return
         config = KVCachingConfig(
@@ -921,7 +921,7 @@ class HunyuanVideoTransformer3DModelPacked(ModelMixin, ConfigMixin, PeftAdapterM
             verbose=verbose,
         )
         self.kv_cache_manager = KVCachingManager(config)
-        self.enable_kv_cache = True
+        self.kv_cache_enabled = True
 
     def install_image_projection(self, in_channels):
         self.image_projection = ClipVisionProjection(in_channels=in_channels, out_channels=self.inner_dim)

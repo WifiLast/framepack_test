@@ -783,7 +783,13 @@ print(f'High-VRAM Mode: {high_vram}')
 QUANT_BITS = int(os.environ.get("FRAMEPACK_QUANT_BITS", "8"))
 USE_BITSANDBYTES = os.environ.get("FRAMEPACK_USE_BNB", "0") == "1"
 USE_FSDP = os.environ.get("FRAMEPACK_USE_FSDP", "0") == "1"
-ENABLE_QUANT = os.environ.get("FRAMEPACK_ENABLE_QUANT", "0") == "1"
+_enable_quant_env = os.environ.get("FRAMEPACK_ENABLE_QUANT")
+if _enable_quant_env is None:
+    ENABLE_QUANT = not high_vram
+    if ENABLE_QUANT:
+        print('Low VRAM detected -> enabling module quantization by default.')
+else:
+    ENABLE_QUANT = _enable_quant_env == "1"
 ENABLE_PRUNE = os.environ.get("FRAMEPACK_ENABLE_PRUNE", "0") == "1"
 ENABLE_OPT_CACHE = os.environ.get("FRAMEPACK_ENABLE_OPT_CACHE", "1") == "1"
 ENABLE_MODULE_CACHE = os.environ.get("FRAMEPACK_ENABLE_MODULE_CACHE", "1") == "1"
@@ -1001,7 +1007,10 @@ if ENABLE_QUANT:
         apply_int_nbit_quantization(module, num_bits=QUANT_BITS, target_dtype=MODEL_COMPUTE_DTYPE)
         enforce_low_precision(module, activation_dtype=MODEL_COMPUTE_DTYPE)
 else:
-    print('FRAMEPACK_ENABLE_QUANT=0 -> skipping module quantization.')
+    if _enable_quant_env is None:
+        print('High-VRAM configuration -> skipping module quantization.')
+    else:
+        print('FRAMEPACK_ENABLE_QUANT=0 -> skipping module quantization.')
     for module in (vae, image_encoder, transformer_core):
         enforce_low_precision(module, activation_dtype=MODEL_COMPUTE_DTYPE)
     if not USE_BITSANDBYTES:
