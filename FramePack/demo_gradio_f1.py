@@ -6,6 +6,31 @@ os.environ['HF_HOME'] = os.path.abspath(os.path.realpath(os.path.join(os.path.di
 
 import gradio as gr
 import torch
+
+
+def _install_torch_compile_guard():
+    """Wrap torch.compile to avoid duplicate template crashes when optional deps import."""
+    if getattr(torch, "_framepack_compile_guard", False):
+        return
+    orig_compile = getattr(torch, "compile", None)
+    if not callable(orig_compile):
+        return
+
+    def safe_compile(fn, *args, **kwargs):
+        try:
+            return orig_compile(fn, *args, **kwargs)
+        except AssertionError as exc:
+            if "duplicate template name" in str(exc):
+                fn_name = getattr(fn, "__name__", repr(fn))
+                print(f"torch.compile failed for {fn_name} due to duplicate template name; falling back to eager execution.")
+                return fn
+            raise
+
+    torch.compile = safe_compile
+    torch._framepack_compile_guard = True
+
+
+_install_torch_compile_guard()
 import traceback
 import einops
 import safetensors.torch as sf
@@ -53,7 +78,26 @@ tokenizer_2 = CLIPTokenizer.from_pretrained("hunyuanvideo-community/HunyuanVideo
 vae = AutoencoderKLHunyuanVideo.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='vae', torch_dtype=torch.float16).cpu()
 
 feature_extractor = SiglipImageProcessor.from_pretrained("lllyasviel/flux_redux_bfl", subfolder='feature_extractor')
-image_encoder = SiglipVisionModel.from_pretrained("lllyasviel/flux_redux_bfl", subfolder='image_encoder', torch_dtype=torch.float16).cpu()
+
+
+def _load_siglip_image_encoder():
+    def _build(dtype):
+        return SiglipVisionModel.from_pretrained(
+            "lllyasviel/flux_redux_bfl",
+            subfolder='image_encoder',
+            torch_dtype=dtype,
+        ).cpu()
+
+    try:
+        return _build(torch.float16)
+    except NotImplementedError as exc:
+        if "meta tensor" not in str(exc).lower():
+            raise
+        print("SigLip image encoder failed to load in float16; retrying with float32 weights.")
+        return _build(torch.float32)
+
+
+image_encoder = _load_siglip_image_encoder()
 
 transformer = HunyuanVideoTransformer3DModelPacked.from_pretrained('lllyasviel/FramePack_F1_I2V_HY_20250503', torch_dtype=torch.bfloat16).cpu()
 

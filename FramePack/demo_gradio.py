@@ -2,10 +2,65 @@ from diffusers_helper.hf_login import login
 
 import os
 
-os.environ['HF_HOME'] = os.path.abspath(os.path.realpath(os.path.join(os.path.dirname(__file__), './hf_download')))
+HF_HOME = os.path.abspath(os.path.realpath(os.path.join(os.path.dirname(__file__), './hf_download')))
+os.environ['HF_HOME'] = HF_HOME
+HF_REPO_CACHE_ROOT = os.path.join(os.path.dirname(__file__), 'Cache', 'hf_repos')
+os.makedirs(HF_REPO_CACHE_ROOT, exist_ok=True)
+
+ENABLE_QUANT = False
+def _repo_cache_dir_name(repo_id: str) -> str:
+    return repo_id.replace('/', '__').replace(':', '_')
+
+
+def _prepare_local_repo(repo_id: str, env_var: str, *, preload: bool, parallel_workers: int) -> str:
+    override = os.environ.get(env_var)
+    if override:
+        return override
+    if not preload or snapshot_download is None:
+        return repo_id
+    cache_dir = os.path.join(HF_REPO_CACHE_ROOT, _repo_cache_dir_name(repo_id))
+    os.makedirs(cache_dir, exist_ok=True)
+    try:
+        local_path = snapshot_download(
+            repo_id=repo_id,
+            local_dir=cache_dir,
+            local_dir_use_symlinks=False,
+            resume_download=True,
+            max_workers=max(1, parallel_workers),
+        )
+        print(f'Preloaded {repo_id} into {local_path}')
+        return local_path
+    except Exception as exc:
+        print(f'Warning: unable to preload {repo_id}: {exc}')
+        return repo_id
 
 import gradio as gr
 import torch
+
+
+def _install_torch_compile_guard():
+    """Wrap torch.compile to gracefully handle known duplicate template issues."""
+    if getattr(torch, "_framepack_compile_guard", False):
+        return
+    orig_compile = getattr(torch, "compile", None)
+    if not callable(orig_compile):
+        return
+
+    def safe_compile(fn, *args, **kwargs):
+        try:
+            return orig_compile(fn, *args, **kwargs)
+        except AssertionError as exc:
+            if "duplicate template name" in str(exc):
+                fn_name = getattr(fn, "__name__", repr(fn))
+                print(f"torch.compile failed for {fn_name} due to duplicate template name; using eager fallback.")
+                return fn
+            raise
+
+    torch.compile = safe_compile
+    torch._framepack_compile_guard = True
+
+
+_install_torch_compile_guard()
 import traceback
 import einops
 import safetensors.torch as sf
@@ -18,12 +73,17 @@ import pathlib
 import threading
 from collections import OrderedDict
 from functools import partial
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Sequence, Tuple
 
 import torch.nn.functional as F
 
 from PIL import Image
 from diffusers import AutoencoderKLHunyuanVideo
+try:
+    from huggingface_hub import snapshot_download
+except Exception:
+    snapshot_download = None
 from transformers import (
     LlamaModel,
     CLIPTextModel,
@@ -104,6 +164,13 @@ def _tensor_to_cache_copy(tensor):
 
 def _tensor_to_device(tensor, device):
     return tensor.to(device=device, non_blocking=True)
+
+
+def _load_component(name: str, loader_fn):
+    print(f'Loading {name}...')
+    value = loader_fn()
+    print(f'{name} ready.')
+    return value
 
 
 def _infer_tensor_device(bound_args: Dict[str, Any]):
@@ -731,6 +798,11 @@ args = parser.parse_args()
 print(args)
 
 FAST_START = args.fast_start or os.environ.get("FRAMEPACK_FAST_START", "0") == "1"
+PARALLEL_LOADERS = int(os.environ.get("FRAMEPACK_PARALLEL_LOADERS", "0"))
+if PARALLEL_LOADERS <= 1 and FAST_START:
+    PARALLEL_LOADERS = 4
+PRELOAD_REPOS = os.environ.get("FRAMEPACK_PRELOAD_REPOS", "1") == "1"
+FORCE_PARALLEL_LOADERS = os.environ.get("FRAMEPACK_FORCE_PARALLEL_LOADERS", "0") == "1"
 
 CACHE_MODE = args.cache_mode.lower()
 
@@ -756,7 +828,7 @@ TENSOR_CORE_MULTIPLE = tensor_core_multiple_for_dtype(MODEL_COMPUTE_DTYPE, INFER
 CPU_PREPROCESS_ACCEL = cpu_preprocessing_active()
 if CPU_PREPROCESS_ACCEL:
     print('CPU-side preprocessing acceleration enabled (SIMD/OpenCV + oneDAL).')
-ENABLE_FBCACHE = (os.environ.get("FRAMEPACK_ENABLE_FBCACHE", "1") == "1") and not args.disable_fbcache
+ENABLE_FBCACHE = (os.environ.get("FRAMEPACK_ENABLE_FBCACHE", "0") == "1") and not args.disable_fbcache
 FBCACHE_THRESHOLD = float(os.environ.get("FRAMEPACK_FBCACHE_THRESHOLD", "0.035"))
 FBCACHE_VERBOSE = os.environ.get("FRAMEPACK_FBCACHE_VERBOSE", "0") == "1"
 ENABLE_SIM_CACHE = (os.environ.get("FRAMEPACK_ENABLE_SIM_CACHE", "0") == "1") and not args.disable_sim_cache
@@ -783,19 +855,22 @@ high_vram = free_mem_gb > 60
 
 print(f'Free VRAM {free_mem_gb} GB')
 print(f'High-VRAM Mode: {high_vram}')
+if PARALLEL_LOADERS > 1 and not high_vram and not FORCE_PARALLEL_LOADERS:
+    print('Low VRAM detected -> disabling parallel model loading to save memory.')
+    PARALLEL_LOADERS = 1
 QUANT_BITS = int(os.environ.get("FRAMEPACK_QUANT_BITS", "8"))
 USE_BITSANDBYTES = os.environ.get("FRAMEPACK_USE_BNB", "0") == "1"
 USE_FSDP = os.environ.get("FRAMEPACK_USE_FSDP", "0") == "1"
 _enable_quant_env = os.environ.get("FRAMEPACK_ENABLE_QUANT")
 if _enable_quant_env is None:
-    ENABLE_QUANT = not high_vram
-    if ENABLE_QUANT:
-        print('Low VRAM detected -> enabling module quantization by default.')
+    ENABLE_QUANT = False
+    print('FRAMEPACK_ENABLE_QUANT not set -> skipping module quantization by default.')
 else:
     ENABLE_QUANT = _enable_quant_env == "1"
 ENABLE_PRUNE = os.environ.get("FRAMEPACK_ENABLE_PRUNE", "0") == "1"
-ENABLE_OPT_CACHE = os.environ.get("FRAMEPACK_ENABLE_OPT_CACHE", "1") == "1"
-ENABLE_MODULE_CACHE = os.environ.get("FRAMEPACK_ENABLE_MODULE_CACHE", "1") == "1"
+ENABLE_OPT_CACHE = os.environ.get("FRAMEPACK_ENABLE_OPT_CACHE", "0") == "1"
+ENABLE_MODULE_CACHE = os.environ.get("FRAMEPACK_ENABLE_MODULE_CACHE", "0") == "1"
+ENABLE_COMPILE = os.environ.get("FRAMEPACK_ENABLE_COMPILE", "0") == "1"
 CACHE_ROOT = os.environ.get(
     "FRAMEPACK_MODULE_CACHE_DIR",
     os.path.join(os.path.dirname(__file__), "module_cache"),
@@ -814,6 +889,26 @@ elif ENABLE_OPT_CACHE and FAST_START:
     print('Fast-start mode -> skipping optimized transformer cache initialization.')
 bnb_config = None
 bnb_device_map = os.environ.get("FRAMEPACK_BNB_DEVICE_MAP", "auto")
+
+_parallel_workers = max(1, PARALLEL_LOADERS if PARALLEL_LOADERS > 0 else 1)
+MODEL_REPO_SOURCE = _prepare_local_repo(
+    "hunyuanvideo-community/HunyuanVideo",
+    "FRAMEPACK_MODEL_REPO_PATH",
+    preload=PRELOAD_REPOS,
+    parallel_workers=_parallel_workers,
+)
+SIGLIP_REPO_SOURCE = _prepare_local_repo(
+    "lllyasviel/flux_redux_bfl",
+    "FRAMEPACK_SIGLIP_REPO_PATH",
+    preload=PRELOAD_REPOS,
+    parallel_workers=_parallel_workers,
+)
+TRANSFORMER_REPO_SOURCE = _prepare_local_repo(
+    "lllyasviel/FramePackI2V_HY",
+    "FRAMEPACK_TRANSFORMER_REPO_PATH",
+    preload=PRELOAD_REPOS,
+    parallel_workers=_parallel_workers,
+)
 
 
 def _resolve_cache_size(env_key, default):
@@ -939,17 +1034,64 @@ if USE_BITSANDBYTES:
         low_cpu_mem_usage=True,
     )
 
-text_encoder = LlamaModel.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='text_encoder', **text_encoder_kwargs)
-text_encoder_2 = CLIPTextModel.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='text_encoder_2', **clip_text_kwargs)
+def _load_text_encoder():
+    return LlamaModel.from_pretrained(MODEL_REPO_SOURCE, subfolder='text_encoder', **text_encoder_kwargs)
+
+
+def _load_clip_text():
+    return CLIPTextModel.from_pretrained(MODEL_REPO_SOURCE, subfolder='text_encoder_2', **clip_text_kwargs)
+
+
+def _load_vae():
+    return AutoencoderKLHunyuanVideo.from_pretrained(
+        MODEL_REPO_SOURCE, subfolder='vae', torch_dtype=torch.float16
+    ).cpu()
+
+
+def _load_image_encoder():
+    def _build(dtype):
+        return SiglipVisionModel.from_pretrained(
+            SIGLIP_REPO_SOURCE,
+            subfolder='image_encoder',
+            torch_dtype=dtype,
+            low_cpu_mem_usage=False,
+        ).to('cpu')
+
+    try:
+        return _build(torch.float16)
+    except NotImplementedError as exc:
+        if "meta tensor" not in str(exc).lower():
+            raise
+        print("SigLip image encoder could not materialize in float16 on this platform. Retrying with float32 weights.")
+        return _build(torch.float32)
+
+
+if PARALLEL_LOADERS > 1:
+    print(f'Loading core models with {PARALLEL_LOADERS} parallel workers.')
+    with ThreadPoolExecutor(max_workers=PARALLEL_LOADERS) as executor:
+        futures = {
+            'text_encoder': executor.submit(_load_component, 'text encoder', _load_text_encoder),
+            'text_encoder_2': executor.submit(_load_component, 'clip text encoder', _load_clip_text),
+            'vae': executor.submit(_load_component, 'VAE', _load_vae),
+            'image_encoder': executor.submit(_load_component, 'SigLip image encoder', _load_image_encoder),
+        }
+        text_encoder = futures['text_encoder'].result()
+        text_encoder_2 = futures['text_encoder_2'].result()
+        vae = futures['vae'].result()
+        image_encoder = futures['image_encoder'].result()
+else:
+    text_encoder = _load_component('text encoder', _load_text_encoder)
+    text_encoder_2 = _load_component('clip text encoder', _load_clip_text)
+    vae = _load_component('VAE', _load_vae)
+    image_encoder = _load_component('SigLip image encoder', _load_image_encoder)
+
 if not USE_BITSANDBYTES:
     text_encoder = text_encoder.cpu()
     text_encoder_2 = text_encoder_2.cpu()
-tokenizer = LlamaTokenizerFast.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='tokenizer')
-tokenizer_2 = CLIPTokenizer.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='tokenizer_2')
-vae = AutoencoderKLHunyuanVideo.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='vae', torch_dtype=torch.float16).cpu()
+tokenizer = LlamaTokenizerFast.from_pretrained(MODEL_REPO_SOURCE, subfolder='tokenizer')
+tokenizer_2 = CLIPTokenizer.from_pretrained(MODEL_REPO_SOURCE, subfolder='tokenizer_2')
+feature_extractor = SiglipImageProcessor.from_pretrained(SIGLIP_REPO_SOURCE, subfolder='feature_extractor')
 
-feature_extractor = SiglipImageProcessor.from_pretrained("lllyasviel/flux_redux_bfl", subfolder='feature_extractor')
-image_encoder = SiglipVisionModel.from_pretrained("lllyasviel/flux_redux_bfl", subfolder='image_encoder', torch_dtype=torch.float16).cpu()
 
 optimized_transformer_loaded = False
 if OPTIMIZED_MODEL_PATH and os.path.isfile(OPTIMIZED_MODEL_PATH):
@@ -957,7 +1099,7 @@ if OPTIMIZED_MODEL_PATH and os.path.isfile(OPTIMIZED_MODEL_PATH):
     optimized_transformer_loaded = True
     print(f'Loaded optimized transformer weights from {OPTIMIZED_MODEL_PATH}')
 else:
-    transformer_core = HunyuanVideoTransformer3DModelPacked.from_pretrained('lllyasviel/FramePackI2V_HY', torch_dtype=torch.bfloat16).cpu()
+    transformer_core = HunyuanVideoTransformer3DModelPacked.from_pretrained(TRANSFORMER_REPO_SOURCE, torch_dtype=torch.bfloat16).cpu()
 
 vae.eval()
 text_encoder.eval()
@@ -1013,7 +1155,7 @@ if ENABLE_QUANT:
         enforce_low_precision(module, activation_dtype=MODEL_COMPUTE_DTYPE)
 else:
     if _enable_quant_env is None:
-        print('High-VRAM configuration -> skipping module quantization.')
+        print('FRAMEPACK_ENABLE_QUANT not set -> skipping module quantization.')
     else:
         print('FRAMEPACK_ENABLE_QUANT=0 -> skipping module quantization.')
     for module in (vae, image_encoder, transformer_core):
@@ -1022,18 +1164,23 @@ else:
         enforce_low_precision(text_encoder, activation_dtype=MODEL_COMPUTE_DTYPE)
         enforce_low_precision(text_encoder_2, activation_dtype=MODEL_COMPUTE_DTYPE)
 
-if torch.cuda.is_available() and not FAST_START:
+if torch.cuda.is_available() and not FAST_START and ENABLE_COMPILE:
     if not USE_BITSANDBYTES:
         text_encoder = maybe_compile_module(text_encoder, mode="reduce-overhead", dynamic=False)
         text_encoder_2 = maybe_compile_module(text_encoder_2, mode="reduce-overhead", dynamic=False)
     image_encoder = maybe_compile_module(image_encoder, mode="reduce-overhead", dynamic=False)
+elif not ENABLE_COMPILE:
+    print('FRAMEPACK_ENABLE_COMPILE=0 -> skipping torch.compile for encoders.')
 elif torch.cuda.is_available() and FAST_START:
     print('Fast-start mode -> skipping torch.compile for encoders.')
 
-if INFERENCE_CONFIG.torchscript.mode == "off" and not FAST_START:
-    transformer_core = maybe_compile_module(transformer_core, mode="reduce-overhead", dynamic=True)
-elif INFERENCE_CONFIG.torchscript.mode == "off" and FAST_START:
-    print('Fast-start mode -> skipping torch.compile for transformer.')
+if INFERENCE_CONFIG.torchscript.mode == "off":
+    if ENABLE_COMPILE and not FAST_START:
+        transformer_core = maybe_compile_module(transformer_core, mode="reduce-overhead", dynamic=True)
+    elif not ENABLE_COMPILE:
+        print('FRAMEPACK_ENABLE_COMPILE=0 -> skipping torch.compile for transformer.')
+    elif FAST_START:
+        print('Fast-start mode -> skipping torch.compile for transformer.')
 else:
     print(f'Skipping torch.compile for transformer (TorchScript mode: {INFERENCE_CONFIG.torchscript.mode}).')
 
@@ -1159,6 +1306,30 @@ stream = AsyncStream()
 
 outputs_folder = './outputs/'
 os.makedirs(outputs_folder, exist_ok=True)
+
+
+def vae_decode_chunked(latents, vae, chunk_size=8):
+    """Decode latents in chunks to avoid OOM errors."""
+    b, c, t, h, w = latents.shape
+
+    if t <= chunk_size:
+        # Small enough to decode at once
+        return vae_decode(latents, vae)
+
+    # Decode in chunks
+    chunks = []
+    for i in range(0, t, chunk_size):
+        end_idx = min(i + chunk_size, t)
+        chunk_latents = latents[:, :, i:end_idx, :, :]
+        with inference_autocast():
+            chunk_pixels = vae_decode(chunk_latents, vae)
+        chunks.append(chunk_pixels.cpu())
+        # Clear CUDA cache after each chunk
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    # Concatenate all chunks
+    return torch.cat(chunks, dim=2)
 
 
 @torch.inference_mode()
@@ -1332,7 +1503,7 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
                 with inference_autocast():
                     preview = vae_decode_fake(preview)
 
-                preview = (preview * 255.0).detach().cpu().numpy().clip(0, 255).astype(np.uint8)
+                preview = (preview * 255.0).detach().float().cpu().numpy().clip(0, 255).astype(np.uint8)
                 preview = einops.rearrange(preview, 'b c t h w -> (b h) (t w) c')
 
                 if stream.input_queue.top() == 'end':
@@ -1391,14 +1562,12 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
             real_history_latents = history_latents[:, :, :total_generated_latent_frames, :, :]
 
             if history_pixels is None:
-                with inference_autocast():
-                    history_pixels = vae_decode(real_history_latents, vae).cpu()
+                history_pixels = vae_decode_chunked(real_history_latents, vae, chunk_size=4)
             else:
                 section_latent_frames = (latent_window_size * 2 + 1) if is_last_section else (latent_window_size * 2)
                 overlapped_frames = latent_window_size * 4 - 3
 
-                with inference_autocast():
-                    current_pixels = vae_decode(real_history_latents[:, :, :section_latent_frames], vae).cpu()
+                current_pixels = vae_decode_chunked(real_history_latents[:, :, :section_latent_frames], vae, chunk_size=4)
                 history_pixels = soft_append_bcthw(current_pixels, history_pixels, overlapped_frames)
 
             if not high_vram:
