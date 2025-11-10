@@ -73,6 +73,17 @@ To start the GUI, run:
 
 Note that it supports `--share`, `--port`, `--server`, and so on.
 
+## Inference Optimizations
+
+FramePack ships with an inference-focused execution engine. Models are always switched to `model.eval()` and run under `torch.inference_mode()` with automatic mixed precision (FP16 or BF16 when available), TF32 matmul (Ampere+), and tensor-core friendly padding for latent/context dimensions.
+
+- `--jit-mode {off,trace,script}` toggles optional TorchScript compilation. The default artifact path is `optimized_models/transformer_torchscript.pt`, but you can override it via `FRAMEPACK_JIT_ARTIFACT`, `FRAMEPACK_JIT_SAVE`, or load an existing module with `FRAMEPACK_JIT_LOAD`.
+- `FRAMEPACK_JIT_STRICT=1` enforces strict shape checking during tracing. Artifacts are frozen, optimized, and can be loaded later with `torch.jit.load` (metadata is stored alongside the `.pt` file).
+- Autocast behaviour can be adjusted with `FRAMEPACK_AUTOCAST_DTYPE` (`fp16`, `bf16`, `fp32`) and `FRAMEPACK_ENABLE_AUTOCAST=0` (disable). Set `FRAMEPACK_ALLOW_TF32=0` to keep TF32 off.
+- Tensor-core alignment factors can be tuned through `FRAMEPACK_TENSORCORE_MULT_FP16` and `FRAMEPACK_TENSORCORE_MULT_TF32`. Batch replication for small batches can be managed via `FRAMEPACK_MIN_BATCH`.
+
+These knobs keep inference paths deterministic while allowing you to trade build time for runtime performance when deploying on constrained GPUs or exporting TorchScript modules.
+
 The software supports PyTorch attention, xformers, flash-attn, sage-attention. By default, it will just use PyTorch attention. You can install those attention kernels if you know how. 
 
 For example, to install sage-attention (linux):

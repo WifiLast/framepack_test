@@ -12,9 +12,18 @@ import safetensors.torch as sf
 import numpy as np
 import argparse
 import math
+import hashlib
+import inspect
+import pathlib
+import threading
+from collections import OrderedDict
+from functools import partial
+from typing import Any, Dict, List, Sequence, Tuple
+
+import torch.nn.functional as F
 
 from PIL import Image
-from diffusers import AutoencoderKLHunyuanVideo
+#from diffusers import AutoencoderKLHunyuanVideo
 from transformers import (
     LlamaModel,
     CLIPTextModel,
@@ -41,6 +50,646 @@ from diffusers_helper.optimizations import (
     maybe_wrap_with_fsdp,
     prune_transformer_layers,
 )
+from diffusers_helper.inference import (
+    InferenceConfig,
+    TorchScriptConfig,
+    align_tensor_dim_to_multiple,
+    build_default_inference_config,
+    configure_inference_environment,
+    inference_autocast,
+    prepare_module_for_inference,
+    tensor_core_multiple_for_dtype,
+)
+
+try:
+    import faiss  # type: ignore
+    FAISS_AVAILABLE = True
+except Exception:
+    faiss = None
+    FAISS_AVAILABLE = False
+
+
+CACHE_DEFAULT_DTYPE = torch.float16
+
+
+def _map_nested_tensors(data, fn):
+    if torch.is_tensor(data):
+        return fn(data)
+    if isinstance(data, tuple):
+        return type(data)(_map_nested_tensors(x, fn) for x in data)
+    if isinstance(data, list):
+        return [
+            _map_nested_tensors(x, fn)
+            for x in data
+        ]
+    if isinstance(data, dict):
+        mapped = {k: _map_nested_tensors(v, fn) for k, v in data.items()}
+        try:
+            return type(data)(**mapped)
+        except Exception:
+            return mapped
+    return data
+
+
+def _tensor_to_cache_copy(tensor):
+    target_dtype = CACHE_DEFAULT_DTYPE if tensor.is_floating_point() else tensor.dtype
+    return tensor.detach().to('cpu', dtype=target_dtype, copy=True)
+
+
+def _tensor_to_device(tensor, device):
+    return tensor.to(device=device, non_blocking=True)
+
+
+def _infer_tensor_device(bound_args: Dict[str, Any]):
+    for value in bound_args.values():
+        if torch.is_tensor(value):
+            return value.device
+        if isinstance(value, (list, tuple)):
+            for nested in value:
+                if torch.is_tensor(nested):
+                    return nested.device
+        if isinstance(value, dict):
+            for nested in value.values():
+                if torch.is_tensor(nested):
+                    return nested.device
+    return torch.device('cpu')
+
+
+def _narrow_tensor(tensor, batch_dim, index):
+    if not torch.is_tensor(tensor):
+        return tensor
+    return tensor.narrow(batch_dim, index, 1)
+
+
+def _index_select_tensor(tensor, batch_dim, indices):
+    if not torch.is_tensor(tensor):
+        return tensor
+    if len(indices) == 0:
+        return tensor.narrow(batch_dim, 0, 0)
+    index_tensor = torch.tensor(indices, device=tensor.device, dtype=torch.long)
+    return tensor.index_select(batch_dim, index_tensor)
+
+
+def _split_structure(data, batch_dim, sample_count):
+    if torch.is_tensor(data):
+        return [
+            data.narrow(batch_dim, idx, 1)
+            for idx in range(sample_count)
+        ]
+    if isinstance(data, tuple):
+        children = [_split_structure(item, batch_dim, sample_count) for item in data]
+        return [type(data)(child[idx] for child in children) for idx in range(sample_count)]
+    if isinstance(data, list):
+        children = [_split_structure(item, batch_dim, sample_count) for item in data]
+        return [
+            [child[idx] for child in children]
+            for idx in range(sample_count)
+        ]
+    if isinstance(data, dict):
+        children = {k: _split_structure(v, batch_dim, sample_count) for k, v in data.items()}
+        per_sample = []
+        for idx in range(sample_count):
+            sample_dict = {k: children[k][idx] for k in children}
+            try:
+                per_sample.append(type(data)(**sample_dict))
+            except Exception:
+                per_sample.append(sample_dict)
+        return per_sample
+    return [data for _ in range(sample_count)]
+
+
+def _stack_structure(samples: Sequence[Any], batch_dim):
+    if not samples:
+        return None
+    reference = samples[0]
+    if torch.is_tensor(reference):
+        return torch.cat(samples, dim=batch_dim)
+    if isinstance(reference, tuple):
+        stacked = []
+        for idx in range(len(reference)):
+            stacked.append(_stack_structure([sample[idx] for sample in samples], batch_dim))
+        return type(reference)(stacked)
+    if isinstance(reference, list):
+        return [
+            _stack_structure([sample[idx] for sample in samples], batch_dim)
+            for idx in range(len(reference))
+        ]
+    if isinstance(reference, dict):
+        keys = list(reference.keys())
+        merged = {}
+        for key in keys:
+            merged[key] = _stack_structure([sample[key] for sample in samples], batch_dim)
+        try:
+            return type(reference)(**merged)
+        except Exception:
+            return merged
+    return reference
+
+
+def _hash_tensor(tensor):
+    if not torch.is_tensor(tensor):
+        return b'none'
+    cpu_tensor = tensor.detach().to('cpu', dtype=torch.float32)
+    data = cpu_tensor.contiguous().numpy().view(np.uint8)
+    hasher = hashlib.sha1()
+    hasher.update(str(tuple(cpu_tensor.shape)).encode())
+    hasher.update(str(cpu_tensor.dtype).encode())
+    hasher.update(bytes(data))
+    return hasher.digest()
+
+
+def _stable_hash_name(module_name, revision, normalization, mode, tensor_hashes):
+    hasher = hashlib.sha1()
+    hasher.update(str(module_name).encode())
+    hasher.update(str(revision).encode())
+    hasher.update(str(normalization).encode())
+    hasher.update(str(mode).encode())
+    for name, value in tensor_hashes:
+        hasher.update(name.encode())
+        hasher.update(value)
+    return hasher.hexdigest()
+
+
+def align_to_multiple(value, multiple: int = 8, minimum: int = None):
+    if multiple <= 0:
+        return int(value)
+    aligned = int(math.ceil(max(1, int(value)) / multiple) * multiple)
+    if minimum is not None:
+        aligned = max(aligned, int(minimum))
+    return aligned
+
+
+def align_resolution(height: int, width: int, multiple: int = 64):
+    return align_to_multiple(height, multiple, multiple), align_to_multiple(width, multiple, multiple)
+
+
+def _build_transformer_example(module: torch.nn.Module, dtype: torch.dtype, device: torch.device):
+    config = getattr(module, "config", {})
+    patch = int(config.get("patch_size", 2))
+    patch_t = int(config.get("patch_size_t", 1))
+    in_channels = int(config.get("in_channels", 16))
+    pooled_dim = int(config.get("pooled_projection_dim", 768))
+    image_proj_dim = int(config.get("image_proj_dim", pooled_dim))
+    text_dim = int(config.get("text_embed_dim", 4096))
+
+    batch = 1
+    frames = max(patch_t * 8, 16)
+    height = max(patch * 32, 64)
+    width = max(patch * 32, 64)
+
+    hidden_states = torch.zeros((batch, in_channels, frames, height, width), dtype=dtype, device=device)
+    timestep = torch.ones((batch,), dtype=dtype, device=device)
+
+    tokens = (frames // patch_t) * (height // patch) * (width // patch)
+    encoder_hidden_states = torch.zeros((batch, tokens, text_dim), dtype=dtype, device=device)
+    encoder_attention_mask = torch.ones((batch, tokens), dtype=torch.bool, device=device)
+    pooled_projections = torch.zeros((batch, pooled_dim), dtype=dtype, device=device)
+    guidance = torch.ones((batch,), dtype=dtype, device=device)
+
+    latent_indices = torch.arange(frames, device=device, dtype=torch.long).unsqueeze(0).repeat(batch, 1)
+    clean_latents = torch.zeros_like(hidden_states)
+    clean_latent_indices = latent_indices.clone()
+    clean_latents_2x = torch.zeros_like(hidden_states)
+    clean_latent_2x_indices = latent_indices.clone()
+    clean_latents_4x = torch.zeros_like(hidden_states)
+    clean_latent_4x_indices = latent_indices.clone()
+    image_embeddings = torch.zeros((batch, tokens, image_proj_dim), dtype=dtype, device=device)
+
+    kwargs = dict(
+        encoder_hidden_states=encoder_hidden_states,
+        encoder_attention_mask=encoder_attention_mask,
+        pooled_projections=pooled_projections,
+        guidance=guidance,
+        latent_indices=latent_indices,
+        clean_latents=clean_latents,
+        clean_latent_indices=clean_latent_indices,
+        clean_latents_2x=clean_latents_2x,
+        clean_latent_2x_indices=clean_latent_2x_indices,
+        clean_latents_4x=clean_latents_4x,
+        clean_latent_4x_indices=clean_latent_4x_indices,
+        image_embeddings=image_embeddings,
+        attention_kwargs={},
+        return_dict=False,
+    )
+    return (hidden_states, timestep), kwargs
+
+
+class DiskLRUCache:
+    def __init__(self, cache_dir: str, max_items: int = 128):
+        self.cache_dir = pathlib.Path(cache_dir)
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.max_items = max(0, int(max_items))
+        self._entries = OrderedDict()
+        self._lock = threading.Lock()
+        self._evict_hooks: List = []
+
+    def _path_for_key(self, key: str) -> pathlib.Path:
+        return self.cache_dir / f"{key}.pt"
+
+    def register_evict_hook(self, fn):
+        if fn not in self._evict_hooks:
+            self._evict_hooks.append(fn)
+
+    def _notify_evict(self, key: str):
+        for hook in list(self._evict_hooks):
+            try:
+                hook(key)
+            except Exception:
+                pass
+
+    def get(self, key: str):
+        if not key or self.max_items <= 0:
+            return None
+        path = self._path_for_key(key)
+        with self._lock:
+            if not path.exists():
+                self._entries.pop(key, None)
+                self._notify_evict(key)
+                return None
+            try:
+                value = torch.load(path, map_location='cpu')
+            except Exception:
+                self._entries.pop(key, None)
+                try:
+                    path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                self._notify_evict(key)
+                return None
+            self._entries.pop(key, None)
+            self._entries[key] = path
+            return value
+
+    def set(self, key: str, value):
+        if not key or self.max_items <= 0:
+            return
+        path = self._path_for_key(key)
+        tmp_path = pathlib.Path(f"{path}.{os.getpid()}.tmp")
+        with self._lock:
+            try:
+                torch.save(value, tmp_path)
+                os.replace(tmp_path, path)
+                self._entries.pop(key, None)
+                self._entries[key] = path
+                while len(self._entries) > self.max_items:
+                    old_key, old_path = self._entries.popitem(last=False)
+                    try:
+                        old_path.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                    self._notify_evict(old_key)
+            except Exception:
+                try:
+                    tmp_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+
+class SemanticIndex:
+    def __init__(self, index_path: pathlib.Path, threshold: float = 0.98, metric: str = 'cosine'):
+        self.index_path = pathlib.Path(index_path)
+        self.threshold = float(threshold)
+        self.metric = metric
+        self.keys: List[str] = []
+        self.embeddings = torch.empty((0, 0), dtype=torch.float32)
+        self._faiss_index = None
+        self._faiss_dim = None
+        self._load()
+
+    def _load(self):
+        if self.index_path.exists():
+            try:
+                data = torch.load(self.index_path, map_location='cpu')
+                self.keys = list(data.get('keys', []))
+                emb = data.get('embeddings')
+                if isinstance(emb, torch.Tensor):
+                    self.embeddings = emb.to(dtype=torch.float32, device='cpu')
+                    self._faiss_dim = self.embeddings.shape[1] if self.embeddings.ndim == 2 else None
+            except Exception:
+                self.keys = []
+                self.embeddings = torch.empty((0, 0), dtype=torch.float32)
+        else:
+            self.index_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def _save(self):
+        try:
+            torch.save({'keys': self.keys, 'embeddings': self.embeddings}, self.index_path)
+        except Exception:
+            pass
+
+    def _normalize(self, embedding: torch.Tensor):
+        if not torch.is_tensor(embedding):
+            return None
+        flat = embedding.float().view(-1)
+        if flat.numel() == 0:
+            return None
+        norm = torch.linalg.norm(flat)
+        if norm == 0:
+            return None
+        return (flat / norm).contiguous()
+
+    def _rebuild_faiss(self):
+        if not FAISS_AVAILABLE or self.embeddings.numel() == 0:
+            self._faiss_index = None
+            return
+        try:
+            dim = self.embeddings.shape[1]
+            index = faiss.IndexFlatIP(dim)
+            index.add(np.ascontiguousarray(self.embeddings.numpy()))
+            self._faiss_index = index
+            self._faiss_dim = dim
+        except Exception:
+            self._faiss_index = None
+
+    def add(self, key: str, embedding: torch.Tensor):
+        normalized = self._normalize(embedding)
+        if normalized is None:
+            return
+        normalized = normalized.unsqueeze(0)
+        if self.embeddings.numel() == 0:
+            self.embeddings = normalized.to(dtype=torch.float32, device='cpu')
+        else:
+            if normalized.shape[1] != self.embeddings.shape[1]:
+                self.embeddings = normalized.to(dtype=torch.float32, device='cpu')
+                self.keys = []
+            else:
+                self.embeddings = torch.cat([self.embeddings, normalized.to(dtype=torch.float32, device='cpu')], dim=0)
+        self.keys.append(key)
+        self._save()
+        self._rebuild_faiss()
+
+    def remove(self, key: str):
+        if key not in self.keys:
+            return
+        idx = self.keys.index(key)
+        self.keys.pop(idx)
+        if self.embeddings.shape[0] <= 1:
+            self.embeddings = torch.empty((0, 0), dtype=torch.float32)
+        else:
+            mask = torch.ones(self.embeddings.shape[0], dtype=torch.bool)
+            mask[idx] = False
+            self.embeddings = self.embeddings[mask]
+        self._save()
+        self._rebuild_faiss()
+
+    def find_match(self, embedding: torch.Tensor) -> Tuple[str, float]:
+        if not self.keys:
+            return '', 0.0
+        normalized = self._normalize(embedding)
+        if normalized is None:
+            return '', 0.0
+        normalized = normalized.unsqueeze(0)
+        scores = None
+        best_idx = -1
+        if self._faiss_index is not None:
+            if normalized.shape[1] != self._faiss_dim:
+                return '', 0.0
+            try:
+                distances, indices = self._faiss_index.search(normalized.numpy(), 1)
+                score = float(distances[0][0]) if distances.size else 0.0
+                best_idx = int(indices[0][0]) if indices.size else -1
+                scores = score
+            except Exception:
+                best_idx = -1
+        if best_idx < 0:
+            if self.embeddings.shape[0] == 0 or normalized.shape[1] != self.embeddings.shape[1]:
+                return '', 0.0
+            sims = torch.matmul(self.embeddings, normalized.squeeze(0))
+            score, idx = torch.max(sims, dim=0)
+            best_idx = int(idx)
+            scores = float(score)
+        if best_idx < 0 or best_idx >= len(self.keys):
+            return '', 0.0
+        if scores < self.threshold:
+            return '', scores
+        return self.keys[best_idx], scores
+class ModuleCacheWrapper(torch.nn.Module):
+    def __init__(
+        self,
+        module: torch.nn.Module,
+        cache: DiskLRUCache,
+        *,
+        module_name: str,
+        module_revision: str = None,
+        batch_dim: int = 0,
+        batched_arg_names: Sequence[str] = None,
+        hash_input_names: Sequence[str] = None,
+        normalization_tag: str = 'default',
+        cache_mode: str = 'hash',
+        semantic_embed_fn=None,
+        semantic_threshold: float = 0.98,
+    ):
+        super().__init__()
+        self.inner = module
+        self.cache = cache
+        self.module_name = module_name
+        self.module_revision = module_revision or getattr(getattr(module, 'config', None), 'revision', None) or getattr(getattr(module, 'config', None), '_name_or_path', None) or 'unknown'
+        self.batch_dim = batch_dim
+        self.batched_arg_names = list(batched_arg_names or [])
+        self.hash_input_names = list(hash_input_names or self.batched_arg_names)
+        self.normalization_tag = normalization_tag
+        self.cache_enabled = cache is not None and cache.max_items > 0
+        try:
+            self.forward_signature = inspect.signature(module.forward)
+        except (ValueError, TypeError):
+            self.forward_signature = None
+        self.forward_params = list(self.forward_signature.parameters.keys()) if self.forward_signature else []
+        self.semantic_embed_fn = semantic_embed_fn
+        self.semantic_threshold = semantic_threshold
+        self.semantic_index = None
+        self.cache_mode = 'off'
+        self._evict_hook_registered = False
+        self.set_cache_mode(cache_mode)
+
+    def __getattr__(self, name):
+        if name in {
+            'inner',
+            'cache',
+            'module_name',
+            'module_revision',
+            'batch_dim',
+            'batched_arg_names',
+            'hash_input_names',
+            'normalization_tag',
+            'cache_enabled',
+            'forward_signature',
+            'forward_params',
+            'semantic_embed_fn',
+            'semantic_threshold',
+            'semantic_index',
+            'cache_mode',
+        }:
+            return super().__getattr__(name)
+        return getattr(self.inner, name)
+
+    def set_cache_mode(self, mode: str):
+        if not self.cache_enabled:
+            self.cache_mode = 'off'
+            return
+        normalized = (mode or 'hash').lower()
+        if normalized not in {'hash', 'semantic', 'off'}:
+            normalized = 'hash'
+        self.cache_mode = normalized
+        if self.cache_mode == 'semantic':
+            self._ensure_semantic_index()
+
+    def _ensure_semantic_index(self):
+        if self.semantic_index is not None or not self.cache_enabled:
+            return
+        if self.semantic_embed_fn is None:
+            return
+        index_path = pathlib.Path(self.cache.cache_dir) / f"{self.module_name}_semantic.pt"
+        self.semantic_index = SemanticIndex(index_path, threshold=self.semantic_threshold)
+        if not self._evict_hook_registered:
+            self.cache.register_evict_hook(self._on_cache_evict)
+            self._evict_hook_registered = True
+
+    def _on_cache_evict(self, key: str):
+        if self.semantic_index is not None:
+            self.semantic_index.remove(key)
+
+    def _bind_args(self, args, kwargs):
+        if self.forward_signature is not None:
+            try:
+                bound = self.forward_signature.bind_partial(*args, **kwargs)
+                return dict(bound.arguments)
+            except Exception:
+                pass
+        merged = {}
+        for name, arg in zip(self.forward_params, args):
+            merged[name] = arg
+        merged.update(kwargs)
+        return merged
+
+    def _infer_batch_info(self, bound_args):
+        for name in self.batched_arg_names:
+            value = bound_args.get(name)
+            if torch.is_tensor(value):
+                if value.shape[self.batch_dim] == 0:
+                    continue
+                return value.shape[self.batch_dim], value.device
+        return None, None
+
+    def _build_sample_key(self, sample_inputs):
+        tensor_hashes = []
+        for name in self.hash_input_names:
+            tensor_hashes.append((name, _hash_tensor(sample_inputs.get(name))))
+        mode = 'train' if self.inner.training else 'eval'
+        return _stable_hash_name(self.module_name, self.module_revision, self.normalization_tag, mode, tensor_hashes)
+
+    def _prepare_for_cache(self, data):
+        return _map_nested_tensors(data, _tensor_to_cache_copy)
+
+    def _move_to_runtime(self, data, device):
+        return _map_nested_tensors(data, lambda t: _tensor_to_device(t, device))
+
+    def _compute_semantic_embedding(self, sample_inputs):
+        if self.semantic_embed_fn is None:
+            return None
+        try:
+            embedding = self.semantic_embed_fn(sample_inputs)
+        except Exception:
+            return None
+        if embedding is None:
+            return None
+        if torch.is_tensor(embedding):
+            return embedding.detach().to('cpu')
+        if isinstance(embedding, np.ndarray):
+            return torch.from_numpy(embedding).float()
+        return None
+
+    def _collect_sample_inputs(self, bound_args, index):
+        result = {}
+        for name in self.hash_input_names:
+            value = bound_args.get(name)
+            if torch.is_tensor(value):
+                result[name] = _narrow_tensor(value, self.batch_dim, index)
+            else:
+                result[name] = value
+        return result
+
+    def _gather_batch(self, bound_args, indices):
+        gathered = dict(bound_args)
+        for name in self.batched_arg_names:
+            value = bound_args.get(name)
+            if torch.is_tensor(value):
+                gathered[name] = _index_select_tensor(value, self.batch_dim, indices)
+        return gathered
+
+    def _forward_without_split(self, bound_args):
+        key_inputs = {name: bound_args.get(name) for name in self.hash_input_names}
+        key = self._build_sample_key(key_inputs)
+        runtime_device = _infer_tensor_device(bound_args)
+        if self.cache_mode != 'off':
+            cached = self.cache.get(key)
+            if cached is None and self.cache_mode == 'semantic' and self.semantic_index is not None:
+                sample_inputs = self._collect_sample_inputs(bound_args, 0)
+                embedding = self._compute_semantic_embedding(sample_inputs)
+                if embedding is not None:
+                    match_key, _ = self.semantic_index.find_match(embedding)
+                    if match_key:
+                        cached = self.cache.get(match_key)
+            if cached is not None:
+                return self._move_to_runtime(cached, runtime_device)
+        output = self.inner(**bound_args)
+        if self.cache_mode != 'off':
+            prepared = self._prepare_for_cache(output)
+            self.cache.set(key, prepared)
+            if self.cache_mode == 'semantic' and self.semantic_index is not None:
+                sample_inputs = self._collect_sample_inputs(bound_args, 0)
+                embedding = self._compute_semantic_embedding(sample_inputs)
+                if embedding is not None:
+                    self.semantic_index.add(key, embedding)
+        return output
+
+    def forward(self, *args, **kwargs):
+        if not self.cache_enabled or self.cache_mode == 'off':
+            return self.inner(*args, **kwargs)
+        bound_args = self._bind_args(args, kwargs)
+        batch_size, runtime_device = self._infer_batch_info(bound_args)
+        if batch_size is None or batch_size <= 0:
+            return self._forward_without_split(bound_args)
+
+        assembled_outputs: List[Any] = [None] * batch_size
+        sample_keys: List[str] = [''] * batch_size
+        miss_indices: List[int] = []
+        sample_embeddings: Dict[int, torch.Tensor] = {}
+
+        for idx in range(batch_size):
+            sample_inputs = self._collect_sample_inputs(bound_args, idx)
+            key = self._build_sample_key(sample_inputs)
+            sample_keys[idx] = key
+            cached = self.cache.get(key)
+            if cached is None and self.cache_mode == 'semantic' and self.semantic_index is not None:
+                embedding = self._compute_semantic_embedding(sample_inputs)
+                if embedding is not None:
+                    sample_embeddings[idx] = embedding
+                    match_key, _ = self.semantic_index.find_match(embedding)
+                    if match_key:
+                        cached = self.cache.get(match_key)
+            if cached is None:
+                miss_indices.append(idx)
+            else:
+                assembled_outputs[idx] = self._move_to_runtime(cached, runtime_device)
+
+        if miss_indices:
+            miss_args = self._gather_batch(bound_args, miss_indices)
+            miss_output = self.inner(**miss_args)
+            per_sample_outputs = _split_structure(miss_output, self.batch_dim, len(miss_indices))
+            for idx, sample_output in zip(miss_indices, per_sample_outputs):
+                assembled_outputs[idx] = sample_output
+                key = sample_keys[idx]
+                prepared = self._prepare_for_cache(sample_output)
+                self.cache.set(key, prepared)
+                if self.cache_mode == 'semantic' and self.semantic_index is not None:
+                    embedding = sample_embeddings.get(idx)
+                    if embedding is None:
+                        sample_inputs = self._collect_sample_inputs(bound_args, idx)
+                        embedding = self._compute_semantic_embedding(sample_inputs)
+                    if embedding is not None:
+                        self.semantic_index.add(key, embedding)
+
+        return _stack_structure(assembled_outputs, self.batch_dim)
 
 
 torch.set_float32_matmul_precision("high")
@@ -49,12 +698,20 @@ if torch.cuda.is_available():
     torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
     torch.backends.cudnn.benchmark = True
 
+torch.set_grad_enabled(False)
+
+DEFAULT_CACHE_MODE = os.environ.get("FRAMEPACK_MODULE_CACHE_MODE", "hash").lower()
+SEMANTIC_CACHE_THRESHOLD = float(os.environ.get("FRAMEPACK_SEMANTIC_CACHE_THRESHOLD", "0.985"))
+SEMANTIC_CACHE_THRESHOLD = max(0.0, min(1.0, SEMANTIC_CACHE_THRESHOLD))
+
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--share', action='store_true')
 parser.add_argument("--server", type=str, default='0.0.0.0')
 parser.add_argument("--port", type=int, required=False)
 parser.add_argument("--inbrowser", action='store_true')
+parser.add_argument("--cache-mode", type=str, choices=['hash', 'semantic', 'off'], default=DEFAULT_CACHE_MODE)
+parser.add_argument("--jit-mode", type=str, choices=['off', 'trace', 'script'], default=os.environ.get("FRAMEPACK_JIT_MODE", "off"))
 args = parser.parse_args()
 
 # for win desktop probably use --server 127.0.0.1 --inbrowser
@@ -62,18 +719,46 @@ args = parser.parse_args()
 
 print(args)
 
+CACHE_MODE = args.cache_mode.lower()
+
+jit_mode = (args.jit_mode or "off").lower()
+default_jit_artifact = os.path.join(os.path.dirname(__file__), "optimized_models", "transformer_torchscript.pt")
+jit_artifact = os.environ.get("FRAMEPACK_JIT_ARTIFACT", default_jit_artifact)
+jit_save = os.environ.get("FRAMEPACK_JIT_SAVE", jit_artifact if jit_mode != "off" else None)
+jit_load = os.environ.get("FRAMEPACK_JIT_LOAD")
+if jit_mode != "off" and not jit_load and jit_save and os.path.isfile(jit_save):
+    jit_load = jit_save
+
+torchscript_config = TorchScriptConfig(
+    mode=jit_mode if jit_mode in {"off", "trace", "script"} else "off",
+    strict_shapes=os.environ.get("FRAMEPACK_JIT_STRICT", "0") == "1",
+    save_path=jit_save,
+    load_path=jit_load,
+)
+
+INFERENCE_CONFIG = build_default_inference_config(torchscript=torchscript_config)
+configure_inference_environment(INFERENCE_CONFIG)
+MODEL_COMPUTE_DTYPE = INFERENCE_CONFIG.autocast_dtype if INFERENCE_CONFIG.autocast_dtype in (torch.float16, torch.bfloat16) else torch.float16
+TENSOR_CORE_MULTIPLE = tensor_core_multiple_for_dtype(MODEL_COMPUTE_DTYPE, INFERENCE_CONFIG)
+
 free_mem_gb = get_cuda_free_memory_gb(gpu)
 high_vram = free_mem_gb > 60
 
 print(f'Free VRAM {free_mem_gb} GB')
 print(f'High-VRAM Mode: {high_vram}')
-MODEL_COMPUTE_DTYPE = torch.float16
 QUANT_BITS = int(os.environ.get("FRAMEPACK_QUANT_BITS", "8"))
 USE_BITSANDBYTES = os.environ.get("FRAMEPACK_USE_BNB", "0") == "1"
 USE_FSDP = os.environ.get("FRAMEPACK_USE_FSDP", "0") == "1"
 ENABLE_QUANT = os.environ.get("FRAMEPACK_ENABLE_QUANT", "1") == "1"
 ENABLE_PRUNE = os.environ.get("FRAMEPACK_ENABLE_PRUNE", "1") == "1"
 ENABLE_OPT_CACHE = os.environ.get("FRAMEPACK_ENABLE_OPT_CACHE", "1") == "1"
+ENABLE_MODULE_CACHE = os.environ.get("FRAMEPACK_ENABLE_MODULE_CACHE", "1") == "1"
+CACHE_ROOT = os.environ.get(
+    "FRAMEPACK_MODULE_CACHE_DIR",
+    os.path.join(os.path.dirname(__file__), "module_cache"),
+)
+CACHE_ROOT = os.path.abspath(CACHE_ROOT)
+DEFAULT_CACHE_ITEMS = int(os.environ.get("FRAMEPACK_MODULE_CACHE_SIZE", "256"))
 OPTIMIZED_MODEL_PATH = None
 if ENABLE_OPT_CACHE:
     OPTIMIZED_MODEL_PATH = os.environ.get(
@@ -84,6 +769,105 @@ if ENABLE_OPT_CACHE:
     os.makedirs(OPTIMIZED_MODEL_DIR, exist_ok=True)
 bnb_config = None
 bnb_device_map = os.environ.get("FRAMEPACK_BNB_DEVICE_MAP", "auto")
+
+
+def _resolve_cache_size(env_key, default):
+    try:
+        return int(os.environ.get(env_key, default))
+    except ValueError:
+        return default
+
+
+MODULE_CACHE_WRAPPERS: List[ModuleCacheWrapper] = []
+
+
+def register_cache_wrapper(wrapper):
+    if isinstance(wrapper, ModuleCacheWrapper):
+        MODULE_CACHE_WRAPPERS.append(wrapper)
+    return wrapper
+
+
+def set_cache_mode_for_wrappers(mode: str):
+    normalized = (mode or 'hash').lower()
+    for wrapper in MODULE_CACHE_WRAPPERS:
+        wrapper.set_cache_mode(normalized)
+
+
+def make_module_cache(name: str, default_size: int = None):
+    if not ENABLE_MODULE_CACHE:
+        return None
+    size = _resolve_cache_size(f"FRAMEPACK_MODULE_CACHE_SIZE_{name.upper()}", default_size or DEFAULT_CACHE_ITEMS)
+    if size <= 0:
+        return None
+    cache_dir = os.path.join(CACHE_ROOT, name)
+    os.makedirs(cache_dir, exist_ok=True)
+    return DiskLRUCache(cache_dir, max_items=size)
+
+
+def wrap_with_module_cache(
+    module,
+    *,
+    cache_name: str,
+    normalization_tag: str,
+    batched_arg_names: Sequence[str],
+    hash_input_names: Sequence[str] = None,
+    batch_dim: int = 0,
+    default_cache_size: int = None,
+    cache_mode: str = 'hash',
+    semantic_embed_fn=None,
+    semantic_threshold: float = 0.98,
+):
+    cache = make_module_cache(cache_name, default_cache_size)
+    if cache is None:
+        return module
+    wrapper = ModuleCacheWrapper(
+        module,
+        cache,
+        module_name=cache_name,
+        module_revision=getattr(getattr(module, 'config', None), 'revision', None) or getattr(getattr(module, 'config', None), '_name_or_path', None) or cache_name,
+        batch_dim=batch_dim,
+        batched_arg_names=batched_arg_names,
+        hash_input_names=hash_input_names,
+        normalization_tag=normalization_tag,
+        cache_mode=cache_mode,
+        semantic_embed_fn=semantic_embed_fn,
+        semantic_threshold=semantic_threshold,
+    )
+    return register_cache_wrapper(wrapper)
+
+
+def make_text_semantic_embedder(tokenizer, *, buckets: int = 768):
+    def embed(sample_inputs):
+        input_ids = sample_inputs.get('input_ids') if isinstance(sample_inputs, dict) else None
+        if not torch.is_tensor(input_ids):
+            return None
+        ids = input_ids.view(-1).tolist()
+        text = tokenizer.decode(ids, skip_special_tokens=True)
+        tokens = [tok for tok in text.lower().split() if tok]
+        vec = torch.zeros(buckets, dtype=torch.float32)
+        if not tokens:
+            vec[0] = 1.0
+            return vec
+        for token in tokens:
+            token_hash = int(hashlib.sha1(token.encode('utf-8')).hexdigest(), 16)
+            vec[token_hash % buckets] += 1.0
+        return vec
+
+    return embed
+
+
+def make_image_semantic_embedder(output_size: int = 8):
+    def embed(sample_inputs):
+        pixel_values = sample_inputs.get('pixel_values') if isinstance(sample_inputs, dict) else None
+        if not torch.is_tensor(pixel_values):
+            return None
+        tensor = pixel_values.to('cpu', dtype=torch.float32)
+        if tensor.ndim >= 4:
+            tensor = tensor[0]
+        pooled = F.adaptive_avg_pool2d(tensor, output_size)
+        return pooled.flatten()
+
+    return embed
 
 if USE_BITSANDBYTES:
     load_in_4bit = os.environ.get("FRAMEPACK_BNB_LOAD_IN_4BIT", "0") == "1"
@@ -154,6 +938,55 @@ else:
         enforce_low_precision(text_encoder, activation_dtype=MODEL_COMPUTE_DTYPE)
         enforce_low_precision(text_encoder_2, activation_dtype=MODEL_COMPUTE_DTYPE)
 
+if torch.cuda.is_available():
+    if not USE_BITSANDBYTES:
+        text_encoder = maybe_compile_module(text_encoder, mode="reduce-overhead", dynamic=False)
+        text_encoder_2 = maybe_compile_module(text_encoder_2, mode="reduce-overhead", dynamic=False)
+    image_encoder = maybe_compile_module(image_encoder, mode="reduce-overhead", dynamic=False)
+
+if INFERENCE_CONFIG.torchscript.mode == "off":
+    transformer_core = maybe_compile_module(transformer_core, mode="reduce-overhead", dynamic=True)
+else:
+    print(f'Skipping torch.compile for transformer (TorchScript mode: {INFERENCE_CONFIG.torchscript.mode}).')
+
+llama_semantic_embed = make_text_semantic_embedder(tokenizer)
+clip_semantic_embed = make_text_semantic_embedder(tokenizer_2)
+image_semantic_embed = make_image_semantic_embedder()
+
+text_encoder = wrap_with_module_cache(
+    text_encoder,
+    cache_name='text_encoder_llama',
+    normalization_tag='llama_prompt',
+    batched_arg_names=['input_ids', 'attention_mask'],
+    hash_input_names=['input_ids', 'attention_mask'],
+    default_cache_size=DEFAULT_CACHE_ITEMS,
+    cache_mode=CACHE_MODE,
+    semantic_embed_fn=llama_semantic_embed,
+    semantic_threshold=SEMANTIC_CACHE_THRESHOLD,
+)
+text_encoder_2 = wrap_with_module_cache(
+    text_encoder_2,
+    cache_name='text_encoder_clip',
+    normalization_tag='clip_prompt',
+    batched_arg_names=['input_ids'],
+    hash_input_names=['input_ids'],
+    default_cache_size=max(1, DEFAULT_CACHE_ITEMS // 2),
+    cache_mode=CACHE_MODE,
+    semantic_embed_fn=clip_semantic_embed,
+    semantic_threshold=SEMANTIC_CACHE_THRESHOLD,
+)
+image_encoder = wrap_with_module_cache(
+    image_encoder,
+    cache_name='siglip_image_encoder',
+    normalization_tag='siglip_pixel_values',
+    batched_arg_names=['pixel_values'],
+    hash_input_names=['pixel_values'],
+    default_cache_size=DEFAULT_CACHE_ITEMS,
+    cache_mode=CACHE_MODE,
+    semantic_embed_fn=image_semantic_embed,
+    semantic_threshold=SEMANTIC_CACHE_THRESHOLD,
+)
+
 if ENABLE_PRUNE and not optimized_transformer_loaded:
     prune_transformer_layers(
         transformer_core,
@@ -173,7 +1006,36 @@ if ENABLE_OPT_CACHE and not optimized_transformer_loaded and OPTIMIZED_MODEL_PAT
     torch.save(transformer_core, OPTIMIZED_MODEL_PATH)
     print(f'Saved optimized transformer weights to {OPTIMIZED_MODEL_PATH}')
 
-transformer = maybe_wrap_with_fsdp(transformer_core, compute_dtype=MODEL_COMPUTE_DTYPE)
+if INFERENCE_CONFIG.torchscript.mode != "off" or INFERENCE_CONFIG.torchscript.load_path:
+    try:
+        transformer_device = next(transformer_core.parameters()).device
+    except StopIteration:
+        transformer_device = torch.device('cpu')
+    example_builder = partial(
+        _build_transformer_example,
+        dtype=MODEL_COMPUTE_DTYPE,
+        device=transformer_device,
+    )
+    artifact_target = jit_artifact if INFERENCE_CONFIG.torchscript.mode != "off" else None
+    transformer_core = prepare_module_for_inference(
+        transformer_core,
+        config=INFERENCE_CONFIG,
+        artifact_path=artifact_target,
+        example_builder=example_builder,
+    )
+
+torchscript_active = (
+    INFERENCE_CONFIG.torchscript.mode != "off"
+    or isinstance(transformer_core, torch.jit.ScriptModule)
+    or hasattr(transformer_core, "_compiled")
+)
+
+if torchscript_active and USE_FSDP:
+    print('TorchScript module detected; skipping FSDP wrapping for transformer.')
+    transformer = transformer_core
+else:
+    transformer = maybe_wrap_with_fsdp(transformer_core, compute_dtype=MODEL_COMPUTE_DTYPE)
+
 TRANSFORMER_BACKBONE = transformer_core
 
 if not high_vram:
@@ -200,7 +1062,6 @@ else:
     vae.to(gpu)
     if not USE_FSDP:
         transformer.to(gpu)
-        transformer = maybe_compile_module(transformer, mode="reduce-overhead", dynamic=True)
     transformer.requires_grad_(False)
 
 stream = AsyncStream()
@@ -210,9 +1071,13 @@ os.makedirs(outputs_folder, exist_ok=True)
 
 
 @torch.inference_mode()
-def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf):
+def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, cache_mode, mp4_crf):
+    runtime_cache_mode = (cache_mode or CACHE_MODE).lower()
+    set_cache_mode_for_wrappers(runtime_cache_mode)
+    latent_window_size = align_to_multiple(latent_window_size, multiple=8, minimum=8)
     controller = AdaptiveLatentWindowController(latent_window_size, get_cuda_free_memory_gb(gpu))
-    latent_window_size = controller.window_size
+    latent_window_size = align_to_multiple(controller.window_size, multiple=8, minimum=8)
+    controller.window_size = latent_window_size
     total_latent_sections = (total_second_length * 30) / (latent_window_size * 4)
     total_latent_sections = int(max(round(total_latent_sections), 1))
 
@@ -239,20 +1104,32 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
             fake_diffusers_current_device(text_encoder, gpu)  # since we only encode one text - that is one model move and one encode, offload is same time consumption since it is also one load and one encode.
             load_model_as_complete(text_encoder_2, target_device=gpu)
 
-        llama_vec, clip_l_pooler = encode_prompt_conds(prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2)
+        with inference_autocast():
+            llama_vec, clip_l_pooler = encode_prompt_conds(prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2)
 
         if cfg == 1:
             llama_vec_n, clip_l_pooler_n = torch.zeros_like(llama_vec), torch.zeros_like(clip_l_pooler)
         else:
-            llama_vec_n, clip_l_pooler_n = encode_prompt_conds(n_prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2)
+            with inference_autocast():
+                llama_vec_n, clip_l_pooler_n = encode_prompt_conds(n_prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2)
 
         llama_vec, llama_attention_mask = crop_or_pad_yield_mask(llama_vec, length=512)
+        llama_vec, _ = align_tensor_dim_to_multiple(llama_vec, dim=1, multiple=TENSOR_CORE_MULTIPLE)
+        llama_attention_mask, _ = align_tensor_dim_to_multiple(
+            llama_attention_mask, dim=1, multiple=TENSOR_CORE_MULTIPLE, pad_value=False
+        )
         llama_vec_n, llama_attention_mask_n = crop_or_pad_yield_mask(llama_vec_n, length=512)
+        llama_vec_n, _ = align_tensor_dim_to_multiple(llama_vec_n, dim=1, multiple=TENSOR_CORE_MULTIPLE)
+        llama_attention_mask_n, _ = align_tensor_dim_to_multiple(
+            llama_attention_mask_n, dim=1, multiple=TENSOR_CORE_MULTIPLE, pad_value=False
+        )
 
         llama_vec = llama_vec.to(dtype=MODEL_COMPUTE_DTYPE)
         llama_vec_n = llama_vec_n.to(dtype=MODEL_COMPUTE_DTYPE)
         clip_l_pooler = clip_l_pooler.to(dtype=MODEL_COMPUTE_DTYPE)
         clip_l_pooler_n = clip_l_pooler_n.to(dtype=MODEL_COMPUTE_DTYPE)
+        clip_l_pooler, _ = align_tensor_dim_to_multiple(clip_l_pooler, dim=-1, multiple=TENSOR_CORE_MULTIPLE)
+        clip_l_pooler_n, _ = align_tensor_dim_to_multiple(clip_l_pooler_n, dim=-1, multiple=TENSOR_CORE_MULTIPLE)
 
         # Processing input image
 
@@ -260,6 +1137,7 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
 
         H, W, C = input_image.shape
         height, width = find_nearest_bucket(H, W, resolution=640)
+        height, width = align_resolution(height, width, multiple=64)
         input_image_np = resize_and_center_crop(input_image, target_width=width, target_height=height)
 
         Image.fromarray(input_image_np).save(os.path.join(outputs_folder, f'{job_id}.png'))
@@ -275,7 +1153,8 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
         if not high_vram:
             load_model_as_complete(vae, target_device=gpu)
 
-        start_latent = vae_encode(input_image_pt, vae).to(dtype=MODEL_COMPUTE_DTYPE)
+        with inference_autocast():
+            start_latent = vae_encode(input_image_pt, vae).to(dtype=MODEL_COMPUTE_DTYPE)
 
         # CLIP Vision
 
@@ -284,7 +1163,8 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
         if not high_vram:
             load_model_as_complete(image_encoder, target_device=gpu)
 
-        image_encoder_output = hf_clip_vision_encode(input_image_np, feature_extractor, image_encoder)
+        with inference_autocast():
+            image_encoder_output = hf_clip_vision_encode(input_image_np, feature_extractor, image_encoder)
         image_encoder_last_hidden_state = image_encoder_output.last_hidden_state.to(dtype=MODEL_COMPUTE_DTYPE)
 
         # Dtype
@@ -294,6 +1174,9 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
         clip_l_pooler = clip_l_pooler.to(dtype=MODEL_COMPUTE_DTYPE)
         clip_l_pooler_n = clip_l_pooler_n.to(dtype=MODEL_COMPUTE_DTYPE)
         image_encoder_last_hidden_state = image_encoder_last_hidden_state.to(dtype=MODEL_COMPUTE_DTYPE)
+        image_encoder_last_hidden_state, _ = align_tensor_dim_to_multiple(
+            image_encoder_last_hidden_state, dim=-1, multiple=TENSOR_CORE_MULTIPLE
+        )
 
         # Sampling
 
@@ -347,7 +1230,8 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
 
             def callback(d):
                 preview = d['denoised']
-                preview = vae_decode_fake(preview)
+                with inference_autocast():
+                    preview = vae_decode_fake(preview)
 
                 preview = (preview * 255.0).detach().cpu().numpy().clip(0, 255).astype(np.uint8)
                 preview = einops.rearrange(preview, 'b c t h w -> (b h) (t w) c')
@@ -363,36 +1247,37 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
                 stream.output_queue.push(('progress', (preview, desc, make_progress_bar_html(percentage, hint))))
                 return
 
-            generated_latents = sample_hunyuan(
-                transformer=transformer,
-                sampler='unipc',
-                width=width,
-                height=height,
-                frames=num_frames,
-                real_guidance_scale=cfg,
-                distilled_guidance_scale=gs,
-                guidance_rescale=rs,
-                # shift=3.0,
-                num_inference_steps=steps,
-                generator=rnd,
-                prompt_embeds=llama_vec,
-                prompt_embeds_mask=llama_attention_mask,
-                prompt_poolers=clip_l_pooler,
-                negative_prompt_embeds=llama_vec_n,
-                negative_prompt_embeds_mask=llama_attention_mask_n,
-                negative_prompt_poolers=clip_l_pooler_n,
-                device=gpu,
-                dtype=MODEL_COMPUTE_DTYPE,
-                image_embeddings=image_encoder_last_hidden_state,
-                latent_indices=latent_indices,
-                clean_latents=clean_latents,
-                clean_latent_indices=clean_latent_indices,
-                clean_latents_2x=clean_latents_2x,
-                clean_latent_2x_indices=clean_latent_2x_indices,
-                clean_latents_4x=clean_latents_4x,
-                clean_latent_4x_indices=clean_latent_4x_indices,
-                callback=callback,
-            )
+            with inference_autocast():
+                generated_latents = sample_hunyuan(
+                    transformer=transformer,
+                    sampler='unipc',
+                    width=width,
+                    height=height,
+                    frames=num_frames,
+                    real_guidance_scale=cfg,
+                    distilled_guidance_scale=gs,
+                    guidance_rescale=rs,
+                    # shift=3.0,
+                    num_inference_steps=steps,
+                    generator=rnd,
+                    prompt_embeds=llama_vec,
+                    prompt_embeds_mask=llama_attention_mask,
+                    prompt_poolers=clip_l_pooler,
+                    negative_prompt_embeds=llama_vec_n,
+                    negative_prompt_embeds_mask=llama_attention_mask_n,
+                    negative_prompt_poolers=clip_l_pooler_n,
+                    device=gpu,
+                    dtype=MODEL_COMPUTE_DTYPE,
+                    image_embeddings=image_encoder_last_hidden_state,
+                    latent_indices=latent_indices,
+                    clean_latents=clean_latents,
+                    clean_latent_indices=clean_latent_indices,
+                    clean_latents_2x=clean_latents_2x,
+                    clean_latent_2x_indices=clean_latent_2x_indices,
+                    clean_latents_4x=clean_latents_4x,
+                    clean_latent_4x_indices=clean_latent_4x_indices,
+                    callback=callback,
+                )
 
             if is_last_section:
                 generated_latents = torch.cat([start_latent.to(generated_latents), generated_latents], dim=2)
@@ -407,12 +1292,14 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
             real_history_latents = history_latents[:, :, :total_generated_latent_frames, :, :]
 
             if history_pixels is None:
-                history_pixels = vae_decode(real_history_latents, vae).cpu()
+                with inference_autocast():
+                    history_pixels = vae_decode(real_history_latents, vae).cpu()
             else:
                 section_latent_frames = (latent_window_size * 2 + 1) if is_last_section else (latent_window_size * 2)
                 overlapped_frames = latent_window_size * 4 - 3
 
-                current_pixels = vae_decode(real_history_latents[:, :, :section_latent_frames], vae).cpu()
+                with inference_autocast():
+                    current_pixels = vae_decode(real_history_latents[:, :, :section_latent_frames], vae).cpu()
                 history_pixels = soft_append_bcthw(current_pixels, history_pixels, overlapped_frames)
 
             if not high_vram:
@@ -441,7 +1328,7 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
     return
 
 
-def process(input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf):
+def process(input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, cache_mode, mp4_crf):
     global stream
     assert input_image is not None, 'No input image!'
 
@@ -449,7 +1336,7 @@ def process(input_image, prompt, n_prompt, seed, total_second_length, latent_win
 
     stream = AsyncStream()
 
-    async_run(worker, input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf)
+    async_run(worker, input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, cache_mode, mp4_crf)
 
     output_filename = None
 
@@ -497,6 +1384,12 @@ with block:
 
             with gr.Group():
                 use_teacache = gr.Checkbox(label='Use TeaCache', value=True, info='Faster speed, but often makes hands and fingers slightly worse.')
+                cache_mode_selector = gr.Radio(
+                    label='Cache Mode',
+                    choices=['hash', 'semantic', 'off'],
+                    value=CACHE_MODE,
+                    info='hash = deterministic exact reuse, semantic = FAISS-backed approximate hits, off = disable caching.',
+                )
 
                 n_prompt = gr.Textbox(label="Negative Prompt", value="", visible=False)  # Not used
                 seed = gr.Number(label="Seed", value=31337, precision=0)
@@ -522,7 +1415,7 @@ with block:
 
     gr.HTML('<div style="text-align:center; margin-top:20px;">Share your results and find ideas at the <a href="https://x.com/search?q=framepack&f=live" target="_blank">FramePack Twitter (X) thread</a></div>')
 
-    ips = [input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf]
+    ips = [input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, cache_mode_selector, mp4_crf]
     start_button.click(fn=process, inputs=ips, outputs=[result_video, preview_image, progress_desc, progress_bar, start_button, end_button])
     end_button.click(fn=end_process)
 
