@@ -851,6 +851,10 @@ PRELOAD_REPOS = os.environ.get("FRAMEPACK_PRELOAD_REPOS", "1") == "1"
 FORCE_PARALLEL_LOADERS = os.environ.get("FRAMEPACK_FORCE_PARALLEL_LOADERS", "0") == "1"
 
 CACHE_MODE = args.cache_mode.lower()
+VAE_CHUNK_OVERRIDE = max(0, int(os.environ.get("FRAMEPACK_VAE_CHUNK_SIZE", "0")))
+VAE_CHUNK_RESERVE_GB = float(os.environ.get("FRAMEPACK_VAE_CHUNK_RESERVE_GB", "4.0"))
+VAE_CHUNK_SAFETY = float(os.environ.get("FRAMEPACK_VAE_CHUNK_SAFETY", "1.5"))
+VAE_UPSCALE_FACTOR = max(1, int(os.environ.get("FRAMEPACK_VAE_UPSCALE_FACTOR", "8")))
 
 jit_mode = (args.jit_mode or "off").lower()
 default_jit_artifact = os.path.join(os.path.dirname(__file__), "optimized_models", "transformer_torchscript.pt")
@@ -1389,20 +1393,59 @@ outputs_folder = './outputs/'
 os.makedirs(outputs_folder, exist_ok=True)
 
 
-def vae_decode_chunked(latents, vae, chunk_size=1, quality_mode=False):
-    """Decode latents in chunks to avoid OOM errors.
+def _estimate_decoded_frame_mb(latents):
+    """Rough upper bound of decoded frame memory footprint in MB."""
+    _, _, _, latent_h, latent_w = latents.shape
+    decoded_h = max(1, latent_h * VAE_UPSCALE_FACTOR)
+    decoded_w = max(1, latent_w * VAE_UPSCALE_FACTOR)
+    bytes_per_pixel = 4.0  # assume fp32 activations during VAE decode
+    per_frame_mb = (decoded_h * decoded_w * 3 * bytes_per_pixel) / (1024 ** 2)
+    return max(per_frame_mb, 0.5)
+
+
+def _auto_select_vae_chunk_size(latents, quality_mode=False, requested_chunk=None):
+    total_frames = latents.shape[2]
+    if total_frames <= 1:
+        return 1
+
+    manual_chunk = requested_chunk
+    if manual_chunk is None and VAE_CHUNK_OVERRIDE > 0:
+        manual_chunk = VAE_CHUNK_OVERRIDE
+    if manual_chunk is not None and manual_chunk > 0:
+        return max(1, min(total_frames, int(manual_chunk)))
+
+    chunk_size = 1
+    if torch.cuda.is_available():
+        free_gb = get_cuda_free_memory_gb(gpu)
+        usable_gb = max(0.0, free_gb - VAE_CHUNK_RESERVE_GB)
+        if usable_gb > 0:
+            frame_mb = _estimate_decoded_frame_mb(latents)
+            chunk_size = max(1, int((usable_gb * 1024) / (frame_mb * VAE_CHUNK_SAFETY)))
+    else:
+        # CPU decode path can usually afford a few frames at once
+        chunk_size = min(total_frames, 8)
+
+    if high_vram:
+        chunk_size = max(chunk_size, min(total_frames, 12))
+
+    if quality_mode:
+        chunk_size = max(chunk_size, min(total_frames, 4))
+
+    return max(1, min(total_frames, chunk_size))
+
+
+def vae_decode_chunked(latents, vae, chunk_size=None, quality_mode=False):
+    """Decode latents in dynamically sized chunks to avoid OOM penalties.
 
     Args:
         latents: Latent tensors to decode
         vae: VAE model
-        chunk_size: Number of latent frames to decode at once (1 = most memory-safe)
-        quality_mode: If True, use larger chunks (2-4) for better quality at cost of more VRAM
+        chunk_size: Optional manual chunk override. If None an automatic heuristic is used.
+        quality_mode: If True, uses at least 2-4 frame chunks for better temporal consistency.
     """
     b, c, t, h, w = latents.shape
 
-    # Adjust chunk size for quality mode
-    if quality_mode:
-        chunk_size = min(4, t)  # Use up to 4 frames for better quality
+    chunk_size = _auto_select_vae_chunk_size(latents, quality_mode=quality_mode, requested_chunk=chunk_size)
 
     if t <= chunk_size:
         # Small enough to decode at once
@@ -1688,12 +1731,12 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
                 torch.cuda.synchronize()
 
             if history_pixels is None:
-                history_pixels = vae_decode_chunked(real_history_latents, vae, chunk_size=1, quality_mode=quality_mode)
+                history_pixels = vae_decode_chunked(real_history_latents, vae, chunk_size=None, quality_mode=quality_mode)
             else:
                 section_latent_frames = (latent_window_size * 2 + 1) if is_last_section else (latent_window_size * 2)
                 overlapped_frames = latent_window_size * 4 - 3
 
-                current_pixels = vae_decode_chunked(real_history_latents[:, :, :section_latent_frames], vae, chunk_size=1, quality_mode=quality_mode)
+                current_pixels = vae_decode_chunked(real_history_latents[:, :, :section_latent_frames], vae, chunk_size=None, quality_mode=quality_mode)
                 history_pixels = soft_append_bcthw(current_pixels, history_pixels, overlapped_frames)
 
             if not high_vram:

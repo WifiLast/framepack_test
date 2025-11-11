@@ -1,17 +1,18 @@
 # By lllyasviel
 
+from typing import Any, List, Optional
 
 import torch
 
 
-cpu = torch.device('cpu')
-gpu = torch.device(f'cuda:{torch.cuda.current_device()}')
-gpu_complete_modules = []
+cpu: torch.device = torch.device('cpu')
+gpu: torch.device = torch.device(f'cuda:{torch.cuda.current_device()}')
+gpu_complete_modules: List[torch.nn.Module] = []
 
 
 class DynamicSwapInstaller:
     @staticmethod
-    def _install_module(module: torch.nn.Module, **kwargs):
+    def _install_module(module: torch.nn.Module, **kwargs: Any) -> None:
         original_class = module.__class__
         module.__dict__['forge_backup_original_class'] = original_class
 
@@ -36,28 +37,23 @@ class DynamicSwapInstaller:
             '__getattr__': hacked_get_attr,
         })
 
-        return
-
     @staticmethod
-    def _uninstall_module(module: torch.nn.Module):
+    def _uninstall_module(module: torch.nn.Module) -> None:
         if 'forge_backup_original_class' in module.__dict__:
             module.__class__ = module.__dict__.pop('forge_backup_original_class')
-        return
 
     @staticmethod
-    def install_model(model: torch.nn.Module, **kwargs):
+    def install_model(model: torch.nn.Module, **kwargs: Any) -> None:
         for m in model.modules():
             DynamicSwapInstaller._install_module(m, **kwargs)
-        return
 
     @staticmethod
-    def uninstall_model(model: torch.nn.Module):
+    def uninstall_model(model: torch.nn.Module) -> None:
         for m in model.modules():
             DynamicSwapInstaller._uninstall_module(m)
-        return
 
 
-def fake_diffusers_current_device(model: torch.nn.Module, target_device: torch.device):
+def fake_diffusers_current_device(model: torch.nn.Module, target_device: torch.device) -> None:
     if hasattr(model, 'scale_shift_table'):
         model.scale_shift_table.data = model.scale_shift_table.data.to(target_device)
         return
@@ -68,20 +64,24 @@ def fake_diffusers_current_device(model: torch.nn.Module, target_device: torch.d
             return
 
 
-def get_cuda_free_memory_gb(device=None):
-    if device is None:
-        device = gpu
+def get_cuda_free_memory_gb(device: Optional[torch.device] = None) -> float:
+    target = device or gpu
 
-    memory_stats = torch.cuda.memory_stats(device)
+    memory_stats = torch.cuda.memory_stats(target)
     bytes_active = memory_stats['active_bytes.all.current']
     bytes_reserved = memory_stats['reserved_bytes.all.current']
-    bytes_free_cuda, _ = torch.cuda.mem_get_info(device)
+    bytes_free_cuda, _ = torch.cuda.mem_get_info(target)
     bytes_inactive_reserved = bytes_reserved - bytes_active
     bytes_total_available = bytes_free_cuda + bytes_inactive_reserved
     return bytes_total_available / (1024 ** 3)
 
 
-def move_model_to_device_with_memory_preservation(model, target_device, preserved_memory_gb=0, aggressive=False):
+def move_model_to_device_with_memory_preservation(
+    model: torch.nn.Module,
+    target_device: torch.device,
+    preserved_memory_gb: float = 0,
+    aggressive: bool = False,
+) -> None:
     print(f'Moving {model.__class__.__name__} to {target_device} with preserved memory: {preserved_memory_gb} GB')
 
     modules_list = list(model.modules())
@@ -112,10 +112,14 @@ def move_model_to_device_with_memory_preservation(model, target_device, preserve
 
     model.to(device=target_device)
     torch.cuda.empty_cache()
-    return
 
 
-def offload_model_from_device_for_memory_preservation(model, target_device, preserved_memory_gb=0, aggressive=False):
+def offload_model_from_device_for_memory_preservation(
+    model: torch.nn.Module,
+    target_device: torch.device,
+    preserved_memory_gb: float = 0,
+    aggressive: bool = False,
+) -> None:
     print(f'Offloading {model.__class__.__name__} from {target_device} to preserve memory: {preserved_memory_gb} GB')
 
     modules_list = list(model.modules())
@@ -138,20 +142,18 @@ def offload_model_from_device_for_memory_preservation(model, target_device, pres
     model.to(device=cpu)
     torch.cuda.empty_cache()
     torch.cuda.synchronize()
-    return
 
 
-def unload_complete_models(*args):
-    for m in gpu_complete_modules + list(args):
+def unload_complete_models(*models: torch.nn.Module) -> None:
+    for m in gpu_complete_modules + list(models):
         m.to(device=cpu)
         print(f'Unloaded {m.__class__.__name__} as complete.')
 
     gpu_complete_modules.clear()
     torch.cuda.empty_cache()
-    return
 
 
-def load_model_as_complete(model, target_device, unload=True):
+def load_model_as_complete(model: torch.nn.Module, target_device: torch.device, unload: bool = True) -> None:
     if unload:
         unload_complete_models()
 
@@ -159,15 +161,51 @@ def load_model_as_complete(model, target_device, unload=True):
     print(f'Loaded {model.__class__.__name__} to {target_device} as complete.')
 
     gpu_complete_modules.append(model)
-    return
 
 
-def load_model_chunked(model, target_device, max_chunk_size_mb=512):
+def load_model_chunked(
+    model: torch.nn.Module,
+    target_device: torch.device,
+    max_chunk_size_mb: int = 512,
+) -> None:
     """
     Load model to device in smaller chunks to bypass memory limits.
     Useful for extremely large models (110GB+) on limited VRAM (16GB).
     """
-    print(f'Loading {model.__class__.__name__} to {target_device} in chunks (max {max_chunk_size_mb}MB per chunk)')
+
+    def _chunked_to_device(tensor: torch.Tensor, dest: torch.device, chunk_bytes: int) -> torch.Tensor:
+        if tensor is None:
+            return tensor
+        if tensor.device == dest:
+            return tensor
+        if chunk_bytes <= 0:
+            # Fallback to standard .to() when chunks disabled
+            return tensor.to(device=dest)
+
+        contiguous = tensor.contiguous()
+        flat_src = contiguous.view(-1)
+        total_elems = flat_src.numel()
+        if total_elems == 0:
+            return tensor.to(device=dest)
+
+        elem_bytes = tensor.element_size()
+        if elem_bytes == 0:
+            return tensor.to(device=dest)
+
+        chunk_elems = max(1, chunk_bytes // elem_bytes)
+        dst = torch.empty_like(tensor, device=dest)
+        flat_dst = dst.view(-1)
+
+        for start in range(0, total_elems, chunk_elems):
+            end = min(total_elems, start + chunk_elems)
+            flat_dst[start:end].copy_(flat_src[start:end], non_blocking=False)
+
+        return dst
+
+    max_chunk_size_mb = max(0, int(max_chunk_size_mb))
+    chunk_bytes = max_chunk_size_mb * 1024 * 1024
+
+    print(f'Loading {model.__class__.__name__} to {target_device} in chunks (max {max_chunk_size_mb}MB per transfer)')
 
     unload_complete_models()
 
@@ -180,39 +218,41 @@ def load_model_chunked(model, target_device, max_chunk_size_mb=512):
             torch.cuda.empty_cache()
             torch.cuda.synchronize()
 
-        # Skip modules without parameters
-        if not any(p.numel() > 0 for p in module.parameters(recurse=False)):
-            continue
+        moved = False
 
-        # Move module to target device
-        try:
+        if chunk_bytes <= 0:
             module.to(device=target_device)
-        except RuntimeError as e:
-            if "out of memory" in str(e).lower():
-                print(f'OOM at module {i}, clearing cache and retrying...')
-                torch.cuda.empty_cache()
-                torch.cuda.synchronize()
+            moved = True
+        else:
+            # Move parameters in-place using chunked copies
+            for name, param in module.named_parameters(recurse=False):
+                if param is None:
+                    continue
+                chunked = _chunked_to_device(param.data, target_device, chunk_bytes)
+                param.data = chunked
+                moved = True
 
-                # Try again after clearing
-                try:
-                    module.to(device=target_device)
-                except RuntimeError:
-                    print(f'Failed to load module {i}, keeping on CPU')
-                    module.to(device=cpu)
-            else:
-                raise
+            # Move buffers in-place
+            for name, buf in module.named_buffers(recurse=False):
+                if buf is None:
+                    continue
+                module._buffers[name] = _chunked_to_device(buf, target_device, chunk_bytes)
+                moved = True
 
-        # Clear cache after every module
+            if not moved:
+                # Modules without params/buffers: fall back to standard move
+                module.to(device=target_device)
+
+        # Clear cache after every few modules
         if i % 5 == 0:
             torch.cuda.empty_cache()
 
     print(f'Finished loading {model.__class__.__name__}')
     gpu_complete_modules.append(model)
     torch.cuda.empty_cache()
-    return
 
 
-def force_free_vram(target_gb=2.0):
+def force_free_vram(target_gb: float = 2.0) -> float:
     """
     Aggressively free VRAM until target_gb is available.
     """
