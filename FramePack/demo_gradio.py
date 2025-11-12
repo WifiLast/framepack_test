@@ -1744,7 +1744,7 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
                 move_model_to_device_with_memory_preservation(transformer, target_device=gpu, preserved_memory_gb=gpu_memory_preservation)
 
             if use_teacache:
-                transformer_backbone.initialize_teacache(enable_teacache=True, num_steps=steps)
+                transformer_backbone.initialize_teacache(enable_teacache=True, num_steps=steps,rel_l1_thresh0=0.2)
             else:
                 transformer_backbone.initialize_teacache(enable_teacache=False)
 
