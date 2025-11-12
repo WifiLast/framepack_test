@@ -38,7 +38,33 @@ def _prepare_local_repo(repo_id: str, env_var: str, *, preload: bool, parallel_w
         return repo_id
 
 import gradio as gr
+import gradio.route_utils as gr_route_utils
 import torch
+
+
+def _patch_gradio_proxy_request_url():
+    """Ensure proxied hosts keep their path when Gradio infers the request URL."""
+    if getattr(gr_route_utils, "_framepack_request_url_patch", False):
+        return
+
+    original_get_request_url = gr_route_utils.get_request_url
+
+    def _get_request_url_with_path(request):
+        x_forwarded_host = gr_route_utils.get_first_header_value(request, "x-forwarded-host")
+        if x_forwarded_host:
+            host = x_forwarded_host.split(",")[0].strip()
+            forwarded_proto = gr_route_utils.get_first_header_value(request, "x-forwarded-proto")
+            scheme = (forwarded_proto or request.url.scheme or "http").split(",")[0].strip()
+            path = request.url.path or ""
+            url = f"{scheme}://{host}{path}".split("?", 1)[0].rstrip("/")
+            return url or f"{scheme}://{host}"
+        return original_get_request_url(request)
+
+    gr_route_utils.get_request_url = _get_request_url_with_path
+    gr_route_utils._framepack_request_url_patch = True
+
+
+_patch_gradio_proxy_request_url()
 
 RUNTIME_CACHE_ENABLED = os.environ.get("FRAMEPACK_RUNTIME_CACHE", "1") != "0"
 RUNTIME_CACHE_ROOT = os.environ.get(
