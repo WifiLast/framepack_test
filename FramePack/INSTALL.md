@@ -227,13 +227,48 @@ pip uninstall bitsandbytes -y
 pip install bitsandbytes>=0.41.0
 ```
 
+### TensorRT Warnings (Non-Critical)
+
+You may see these warnings when starting with TensorRT:
+
+```
+WARNING: [Torch-TensorRT] - Unable to read CUDA capable devices. Return status: 35
+Unable to import quantization op. Please install modelopt library
+Unable to import quantize op. Please install modelopt library
+TensorRT-LLM is not installed.
+```
+
+**These are SAFE to ignore!** They indicate missing optional components:
+- **modelopt**: Only needed for INT8/FP8 quantization (we use BitsAndBytes instead)
+- **TensorRT-LLM**: Only for LLM-specific optimizations (not needed for VAE)
+- **CUDA devices warning**: Usually harmless, TensorRT will still work
+
+**TensorRT is working correctly if you see:**
+```
+TensorRT VAE decoder enabled (workspace=4096 MB).
+```
+
+#### Silencing TensorRT Warnings (Optional)
+
+If you want to silence the warnings (not necessary for functionality):
+
+**Install NVIDIA ModelOpt (for quantization warnings):**
+```bash
+pip install "nvidia-modelopt[all]" --extra-index-url https://pypi.nvidia.com
+```
+
+**Note:** Requires NVIDIA PyPI access. This is **purely optional** and only removes warnings.
+
+**TensorRT-LLM** is not needed for FramePack (LLM-only feature). The warning can be ignored.
+
 ### TensorRT Compilation Failures
 
 **Solutions:**
 1. Verify torch-tensorrt matches your PyTorch version
-2. Check CUDA toolkit is installed
+2. Check CUDA toolkit is installed (nvcc --version)
 3. Ensure sufficient VRAM for engine compilation (~2-3 GB extra)
 4. Use fallback: Remove `--enable-tensorrt` flag
+5. Check PyTorch CUDA compatibility: `python -c "import torch; print(torch.cuda.is_available())"`
 
 ## Getting Started
 

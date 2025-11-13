@@ -58,6 +58,16 @@ Then open: **http://localhost:7860**
 
 **Fix:** Reduce "Total Video Length" to 3-4 seconds
 
+### ⚠️ TensorRT Warnings (Safe to Ignore)
+
+```
+WARNING: [Torch-TensorRT] - Unable to read CUDA capable devices
+Unable to import quantization op
+TensorRT-LLM is not installed
+```
+
+**These are normal and safe to ignore!** They indicate optional TensorRT features not installed. TensorRT will still work for VAE decoding.
+
 ## Recommended Settings
 
 ### Best Quality (Slower)

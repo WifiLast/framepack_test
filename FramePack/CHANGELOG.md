@@ -198,6 +198,14 @@ None - All changes are backward compatible with existing configurations.
    - Larger chunks (2-4 frames) require more VRAM
    - **Workaround:** Increase "GPU Memory Preservation" to 10-12 GB
 
+4. **TensorRT startup warnings (SAFE TO IGNORE)**
+   - `WARNING: Unable to read CUDA capable devices. Return status: 35`
+   - `Unable to import quantization op. Please install modelopt library`
+   - `TensorRT-LLM is not installed`
+   - **These are normal!** They indicate optional TensorRT components not installed (modelopt, TensorRT-LLM)
+   - TensorRT VAE acceleration still works correctly
+   - Only install modelopt if you need INT8/FP8 quantization (not required)
+
 ### 📝 Migration Guide
 
 #### From Previous Versions

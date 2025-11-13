@@ -16,6 +16,20 @@ bitsandbytes>=0.41.0  # 4-bit/8-bit model quantization (reduces VRAM usage)
 #   CUDA 11.8: pip install torch-tensorrt --extra-index-url https://download.pytorch.org/whl/cu118
 # torch-tensorrt
 
+# TensorRT Advanced Features (Optional - silences startup warnings)
+# These are NOT required for basic TensorRT VAE acceleration
+# Only install if you need specific features:
+
+# nvidia-modelopt[all]  # For INT8/FP8 quantization optimization
+# Installation: pip install "nvidia-modelopt[all]" --extra-index-url https://pypi.nvidia.com
+# Note: Requires NVIDIA PyPI access, may need authentication
+# Silences warnings: "Unable to import quantization op"
+
+# tensorrt_llm  # For Large Language Model optimizations (not needed for video generation)
+# Installation: Follow https://github.com/NVIDIA/TensorRT-LLM#installation
+# Note: Complex installation, only needed for LLM inference
+# Silences warnings: "TensorRT-LLM is not installed"
+
 # Semantic Caching (FAISS)
 # Choose CPU or GPU version based on your setup
 # faiss-cpu  # CPU version (slower but works everywhere)
