@@ -199,6 +199,7 @@ from diffusers_helper.inference import (
     prepare_module_for_inference,
     tensor_core_multiple_for_dtype,
 )
+from diffusers_helper.tensorrt_runtime import TensorRTRuntime, TensorRTLatentDecoder
 try:
     from third_party.fp8_optimization_utils import optimize_state_dict_with_fp8, apply_fp8_monkey_patch
 except ImportError:
@@ -869,6 +870,12 @@ parser.add_argument("--disable-kv-cache", action='store_true')
 parser.add_argument("--xformers-mode", type=str, choices=["off", "standard", "aggressive"], default=os.environ.get("FRAMEPACK_XFORMERS_MODE", "standard"))
 parser.add_argument("--fast-start", action='store_true', help="Skip optional optimizations to reduce startup latency.")
 parser.add_argument("--use-memory-v2", action="store_true", help="Enable optimized memory_v2 backend (async streams, pinned memory, cached stats).")
+parser.add_argument(
+    "--enable-tensorrt",
+    action="store_true",
+    default=os.environ.get("FRAMEPACK_ENABLE_TENSORRT", "0") == "1",
+    help="Enable experimental TensorRT acceleration for VAE decoding (requires torch-tensorrt).",
+)
 args = parser.parse_args()
 
 # for win desktop probably use --server 127.0.0.1 --inbrowser
@@ -890,6 +897,9 @@ VAE_CHUNK_OVERRIDE = max(0, int(os.environ.get("FRAMEPACK_VAE_CHUNK_SIZE", "0"))
 VAE_CHUNK_RESERVE_GB = float(os.environ.get("FRAMEPACK_VAE_CHUNK_RESERVE_GB", "4.0"))
 VAE_CHUNK_SAFETY = float(os.environ.get("FRAMEPACK_VAE_CHUNK_SAFETY", "1.5"))
 VAE_UPSCALE_FACTOR = max(1, int(os.environ.get("FRAMEPACK_VAE_UPSCALE_FACTOR", "8")))
+TRT_WORKSPACE_MB = int(os.environ.get("FRAMEPACK_TRT_WORKSPACE_MB", "4096"))
+TRT_MAX_AUX_STREAMS = int(os.environ.get("FRAMEPACK_TRT_MAX_AUX_STREAMS", "2"))
+ENABLE_TENSORRT_RUNTIME = args.enable_tensorrt
 
 memory_backend = memory_v2 if args.use_memory_v2 else memory_v1
 memory_optim = None
@@ -1301,6 +1311,30 @@ fp8_buffers_present = any(hasattr(module, "scale_weight") for module in transfor
 if fp8_buffers_present:
     FP8_TRANSFORMER_ACTIVE = True
 
+TENSORRT_RUNTIME = None
+TENSORRT_DECODER = None
+TENSORRT_AVAILABLE = False
+if ENABLE_TENSORRT_RUNTIME:
+    try:
+        TENSORRT_RUNTIME = TensorRTRuntime(
+            enabled=True,
+            precision=MODEL_COMPUTE_DTYPE if MODEL_COMPUTE_DTYPE in (torch.float16, torch.bfloat16) else torch.float16,
+            workspace_size_mb=TRT_WORKSPACE_MB,
+            max_aux_streams=TRT_MAX_AUX_STREAMS,
+        )
+        if TENSORRT_RUNTIME.is_ready:
+            TENSORRT_DECODER = TensorRTLatentDecoder(vae, TENSORRT_RUNTIME, fallback_fn=vae_decode)
+            TENSORRT_AVAILABLE = True
+            print(f"TensorRT VAE decoder enabled (workspace={TRT_WORKSPACE_MB} MB).")
+        else:
+            print(f"TensorRT disabled: {TENSORRT_RUNTIME.failure_reason}")
+    except Exception as exc:
+        TENSORRT_RUNTIME = None
+        TENSORRT_DECODER = None
+        print(f"Failed to initialize TensorRT runtime: {exc}")
+else:
+    print("TensorRT runtime disabled (use --enable-tensorrt to opt-in).")
+
 if ENABLE_FP8 and optimize_state_dict_with_fp8 is not None and apply_fp8_monkey_patch is not None:
     if FP8_TRANSFORMER_ACTIVE:
         print('FP8 scale weights detected on transformer; skipping re-optimization.')
@@ -1608,7 +1642,7 @@ def _auto_select_vae_chunk_size(latents, quality_mode=False, requested_chunk=Non
     return max(1, min(total_frames, chunk_size))
 
 
-def vae_decode_chunked(latents, vae, chunk_size=None, quality_mode=False):
+def vae_decode_chunked(latents, vae, chunk_size=None, quality_mode=False, decoder_fn=None):
     """Decode latents in dynamically sized chunks to avoid OOM penalties.
 
     Args:
@@ -1616,6 +1650,7 @@ def vae_decode_chunked(latents, vae, chunk_size=None, quality_mode=False):
         vae: VAE model
         chunk_size: Optional manual chunk override. If None an automatic heuristic is used.
         quality_mode: If True, uses at least 2-4 frame chunks for better temporal consistency.
+        decoder_fn: Optional callable(latents) returning decoded pixels (used for TensorRT).
     """
     b, c, t, h, w = latents.shape
 
@@ -1623,8 +1658,11 @@ def vae_decode_chunked(latents, vae, chunk_size=None, quality_mode=False):
 
     def _decode_with_chunk_size(active_chunk_size: int):
         if t <= active_chunk_size:
-            with inference_autocast():
-                decoded = vae_decode(latents, vae)
+            if decoder_fn is None:
+                with inference_autocast():
+                    decoded = vae_decode(latents, vae)
+            else:
+                decoded = decoder_fn(latents)
             return decoded.cpu()
 
         chunks = []
@@ -1632,8 +1670,11 @@ def vae_decode_chunked(latents, vae, chunk_size=None, quality_mode=False):
             end_idx = min(i + active_chunk_size, t)
             chunk_latents = latents[:, :, i:end_idx, :, :]
 
-            with inference_autocast():
-                chunk_pixels = vae_decode(chunk_latents, vae)
+            if decoder_fn is None:
+                with inference_autocast():
+                    chunk_pixels = vae_decode(chunk_latents, vae)
+            else:
+                chunk_pixels = decoder_fn(chunk_latents)
 
             # Move to CPU immediately and clear GPU memory
             chunks.append(chunk_pixels.cpu())
@@ -1685,7 +1726,25 @@ def vae_decode_chunked(latents, vae, chunk_size=None, quality_mode=False):
 
 
 @torch.inference_mode()
-def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, slow_prompt_hint, cache_mode, mp4_crf, quality_mode=False):
+def worker(
+    input_image,
+    prompt,
+    n_prompt,
+    seed,
+    total_second_length,
+    latent_window_size,
+    steps,
+    cfg,
+    gs,
+    rs,
+    gpu_memory_preservation,
+    use_teacache,
+    slow_prompt_hint,
+    cache_mode,
+    mp4_crf,
+    quality_mode=False,
+    use_tensorrt_decode=False,
+):
     runtime_cache_mode = (cache_mode or CACHE_MODE).lower()
     set_cache_mode_for_wrappers(runtime_cache_mode)
     latent_window_size = align_to_multiple(latent_window_size, multiple=8, minimum=8)
@@ -1696,6 +1755,10 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
     total_latent_sections = int(max(round(total_latent_sections), 1))
 
     job_id = generate_timestamp()
+    decoder_impl = None
+    if use_tensorrt_decode and TENSORRT_AVAILABLE and TENSORRT_DECODER is not None:
+        decoder_impl = TENSORRT_DECODER.decode
+        print("TensorRT decoder engaged for this job.")
     transformer_backbone = getattr(transformer, "module", None)
     if transformer_backbone is None:
         transformer_backbone = globals().get("TRANSFORMER_BACKBONE", transformer)
@@ -1937,14 +2000,24 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
                 torch.cuda.synchronize()
 
             if history_pixels is None:
-                history_pixels = vae_decode_chunked(real_history_latents, vae, chunk_size=None, quality_mode=quality_mode)
+                history_pixels = vae_decode_chunked(
+                    real_history_latents,
+                    vae,
+                    chunk_size=None,
+                    quality_mode=quality_mode,
+                    decoder_fn=decoder_impl,
+                )
             else:
                 section_latent_frames = (latent_window_size * 2 + 1) if is_last_section else (latent_window_size * 2)
                 section_latent_frames = min(section_latent_frames, real_history_latents.shape[2])
                 overlapped_frames = latent_window_size * 4 - 3
 
                 current_pixels = vae_decode_chunked(
-                    real_history_latents[:, :, :section_latent_frames], vae, chunk_size=None, quality_mode=quality_mode
+                    real_history_latents[:, :, :section_latent_frames],
+                    vae,
+                    chunk_size=None,
+                    quality_mode=quality_mode,
+                    decoder_fn=decoder_impl,
                 )
                 overlap = min(overlapped_frames, current_pixels.shape[2], history_pixels.shape[2])
                 history_pixels = soft_append_bcthw(current_pixels, history_pixels, overlap)
@@ -1977,7 +2050,25 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
     return
 
 
-def process(input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, slow_prompt_hint, cache_mode, mp4_crf, quality_mode):
+def process(
+    input_image,
+    prompt,
+    n_prompt,
+    seed,
+    total_second_length,
+    latent_window_size,
+    steps,
+    cfg,
+    gs,
+    rs,
+    gpu_memory_preservation,
+    use_teacache,
+    slow_prompt_hint,
+    cache_mode,
+    mp4_crf,
+    quality_mode,
+    use_tensorrt_decode,
+):
     global stream
     assert input_image is not None, 'No input image!'
 
@@ -1985,7 +2076,26 @@ def process(input_image, prompt, n_prompt, seed, total_second_length, latent_win
 
     stream = AsyncStream()
 
-    async_run(worker, input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, slow_prompt_hint, cache_mode, mp4_crf, quality_mode)
+    async_run(
+        worker,
+        input_image,
+        prompt,
+        n_prompt,
+        seed,
+        total_second_length,
+        latent_window_size,
+        steps,
+        cfg,
+        gs,
+        rs,
+        gpu_memory_preservation,
+        use_teacache,
+        slow_prompt_hint,
+        cache_mode,
+        mp4_crf,
+        quality_mode,
+        use_tensorrt_decode,
+    )
 
     output_filename = None
 
@@ -2017,27 +2127,28 @@ quick_prompts = [[x] for x in quick_prompts]
 
 
 css = make_progress_bar_css()
-block = gr.Blocks(css=css).queue()
+block = gr.Blocks(css=css, analytics_enabled=False).queue()
 with block:
     gr.Markdown('# FramePack')
-    with gr.Row():
-        with gr.Column():
+    with gr.Row(equal_height=True):
+        with gr.Column(scale=2, min_width=420):
             input_image = gr.Image(sources='upload', type="numpy", label="Image", height=320)
             prompt = gr.Textbox(label="Prompt", value='')
             example_quick_prompts = gr.Dataset(samples=quick_prompts, label='Quick List', samples_per_page=1000, components=[prompt])
             example_quick_prompts.click(lambda x: x[0], inputs=[example_quick_prompts], outputs=prompt, show_progress=False, queue=False)
 
-            with gr.Row():
-                start_button = gr.Button(value="Start Generation")
+            n_prompt = gr.Textbox(label="Negative Prompt", value="", visible=False)  # Not used
+
+            with gr.Row(variant='compact'):
+                seed = gr.Number(label="Seed", value=31337, precision=0)
+                total_second_length = gr.Slider(label="Total Video Length (Seconds)", minimum=1, maximum=120, value=5, step=0.1)
+
+            with gr.Row(variant='compact'):
+                start_button = gr.Button(value="Start Generation", variant='primary')
                 end_button = gr.Button(value="End Generation", interactive=False)
 
-            with gr.Group():
+            with gr.Accordion("Quality & Cache", open=False):
                 use_teacache = gr.Checkbox(label='Use TeaCache', value=True, info='Faster speed, but often makes hands and fingers slightly worse.')
-                slow_prompt_hint = gr.Checkbox(
-                    label='Add "move slowly" hint',
-                    value=True,
-                    info='Appends a slow-motion phrasing to your prompt to encourage smoother motion.',
-                )
                 quality_mode = gr.Checkbox(label='Quality Mode (Better Hands)', value=False, info='Uses larger VAE chunks (2-4 frames) for better quality, especially for hands. Requires more VRAM.')
                 cache_mode_selector = gr.Radio(
                     label='Cache Mode',
@@ -2045,23 +2156,30 @@ with block:
                     value=CACHE_MODE,
                     info='hash = deterministic exact reuse, semantic = FAISS-backed approximate hits, off = disable caching.',
                 )
+                slow_prompt_hint = gr.Checkbox(
+                    label='Add "move slowly" hint',
+                    value=True,
+                    info='Appends a slow-motion phrasing to your prompt to encourage smoother motion.',
+                )
 
-                n_prompt = gr.Textbox(label="Negative Prompt", value="", visible=False)  # Not used
-                seed = gr.Number(label="Seed", value=31337, precision=0)
-
-                total_second_length = gr.Slider(label="Total Video Length (Seconds)", minimum=1, maximum=120, value=5, step=0.1)
+            with gr.Accordion("Sampler Controls", open=False):
                 latent_window_size = gr.Slider(label="Latent Window Size", minimum=1, maximum=33, value=9, step=1, visible=False)  # Should not change
                 steps = gr.Slider(label="Steps", minimum=1, maximum=100, value=25, step=1, info='Changing this value is not recommended.')
-
                 cfg = gr.Slider(label="CFG Scale", minimum=1.0, maximum=32.0, value=1.0, step=0.01, visible=False)  # Should not change
                 gs = gr.Slider(label="Distilled CFG Scale", minimum=1.0, maximum=32.0, value=10.0, step=0.01, info='Changing this value is not recommended.')
                 rs = gr.Slider(label="CFG Re-Scale", minimum=0.0, maximum=1.0, value=0.0, step=0.01, visible=False)  # Should not change
 
+            with gr.Accordion("Performance & Output", open=False):
                 gpu_memory_preservation = gr.Slider(label="GPU Inference Preserved Memory (GB) (larger means slower)", minimum=6, maximum=128, value=6, step=0.1, info="Set this number to a larger value if you encounter OOM. Larger value causes slower speed.")
-
                 mp4_crf = gr.Slider(label="MP4 Compression", minimum=0, maximum=100, value=16, step=1, info="Lower means better quality. 0 is uncompressed. Change to 16 if you get black outputs. ")
+                tensorrt_decode_checkbox = gr.Checkbox(
+                    label="TensorRT VAE Decode (beta)",
+                    value=TENSORRT_AVAILABLE,
+                    visible=TENSORRT_AVAILABLE,
+                    info="Requires torch-tensorrt + CUDA. Falls back automatically if unsupported.",
+                )
 
-        with gr.Column():
+        with gr.Column(scale=1, min_width=360):
             preview_image = gr.Image(label="Next Latents", height=200, visible=False)
             result_video = gr.Video(label="Finished Frames (30 FPS)", autoplay=True, show_share_button=False, height=512, loop=True)
             gr.Markdown('''**Important Notes:**
@@ -2070,12 +2188,31 @@ with block:
 - For better hand quality: Enable "Quality Mode" and disable "TeaCache"
 - If video appears too fast, reduce "Total Video Length" to generate more frames per second of content
 ''')
-            progress_desc = gr.Markdown('', elem_classes='no-generating-animation')
-            progress_bar = gr.HTML('', elem_classes='no-generating-animation')
+            with gr.Accordion("Status", open=True):
+                progress_desc = gr.Markdown('', elem_classes='no-generating-animation')
+                progress_bar = gr.HTML('', elem_classes='no-generating-animation')
 
     gr.HTML('<div style="text-align:center; margin-top:20px;">Share your results and find ideas at the <a href="https://x.com/search?q=framepack&f=live" target="_blank">FramePack Twitter (X) thread</a></div>')
 
-    ips = [input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, slow_prompt_hint, cache_mode_selector, mp4_crf, quality_mode]
+    ips = [
+        input_image,
+        prompt,
+        n_prompt,
+        seed,
+        total_second_length,
+        latent_window_size,
+        steps,
+        cfg,
+        gs,
+        rs,
+        gpu_memory_preservation,
+        use_teacache,
+        slow_prompt_hint,
+        cache_mode_selector,
+        mp4_crf,
+        quality_mode,
+        tensorrt_decode_checkbox,
+    ]
     start_button.click(fn=process, inputs=ips, outputs=[result_video, preview_image, progress_desc, progress_bar, start_button, end_button])
     end_button.click(fn=end_process)
 

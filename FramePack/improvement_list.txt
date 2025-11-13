@@ -1,0 +1,6 @@
+FramePack/demo_gradio.py optimization ideas:
+- Extend `maybe_compile_module(..., dynamic=False)` (or capture CUDA graphs) to cover the VAE encode/decode paths and CLIP vision encoder, since they run with fixed shapes per request and currently dominate wall time on small GPUs.
+- Pin the resized input image buffer and move it to the GPU asynchronously before VAE/CLIP processing to avoid blocking HtoD copies every generation (`torch.from_numpy(...).pin_memory().to(device=gpu, non_blocking=True)`).
+- Overlap sampling, latent merging, VAE decode, and MP4 writing by giving decode its own CUDA stream (plus event fencing) and pushing video encoding to a thread pool; remove the full `torch.cuda.synchronize()` calls that currently stall all kernels.
+- Replace the unconditional model offload/reload cycle after every latent section with a heuristic that only swaps when free VRAM drops below a threshold, or re-run `AdaptiveLatentWindowController` mid-generation so short clips skip costly PCIe transfers.
+- Gate the debug PNG save step behind a verbose flag (or run it asynchronously) so preprocessing isn’t blocked by filesystem I/O, which can add 0.3–0.5 s per request on cloud storage.
