@@ -7,6 +7,11 @@ def hf_clip_vision_encode(image, feature_extractor, image_encoder):
     assert image.dtype == np.uint8
 
     preprocessed = feature_extractor.preprocess(images=image, return_tensors="pt").to(device=image_encoder.device, dtype=image_encoder.dtype)
-    image_encoder_output = image_encoder(**preprocessed)
+    trt_callable = getattr(image_encoder, "_framepack_trt_callable", None)
+    if trt_callable is not None:
+        pixel_values = preprocessed["pixel_values"]
+        image_encoder_output = trt_callable(pixel_values)
+    else:
+        image_encoder_output = image_encoder(**preprocessed)
 
     return image_encoder_output

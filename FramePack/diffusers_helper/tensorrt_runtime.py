@@ -1,5 +1,5 @@
 import threading
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -58,7 +58,14 @@ class TensorRTRuntime:
             raise RuntimeError("torch_tensorrt.Input is unavailable.")
         return TRTInput(shape=tuple(int(dim) for dim in shape), dtype=self.compute_dtype, name=name)
 
-    def get_or_compile(self, name: str, module: nn.Module, inputs) -> nn.Module:
+    def get_or_compile(
+        self,
+        name: str,
+        module: nn.Module,
+        *,
+        input_specs=None,
+        example_inputs: Optional[Tuple[Tuple[Any, ...], Dict[str, Any]]] = None,
+    ) -> nn.Module:
         if not self.enabled:
             raise RuntimeError(self.failure_reason or "TensorRT runtime disabled.")
 
@@ -70,14 +77,27 @@ class TensorRTRuntime:
             module = module.to(device=self.device, dtype=self.compute_dtype)
             module.eval()
 
+            compile_kwargs = dict(
+                enabled_precisions={self.compute_dtype},
+                workspace_size=self.workspace_size,
+                max_aux_streams=self.max_aux_streams,
+            )
             try:
-                compiled = torch_tensorrt.dynamo.compile(
-                    module,
-                    inputs=inputs,
-                    enabled_precisions={self.compute_dtype},
-                    workspace_size=self.workspace_size,
-                    max_aux_streams=self.max_aux_streams,
-                )
+                if input_specs is not None:
+                    compiled = torch_tensorrt.dynamo.compile(
+                        module,
+                        inputs=input_specs,
+                        **compile_kwargs,
+                    )
+                elif example_inputs is not None:
+                    example_args, example_kwargs = example_inputs
+                    compiled = torch_tensorrt.dynamo.compile(
+                        module,
+                        inputs=example_args,
+                        **compile_kwargs,
+                    )
+                else:
+                    raise ValueError("Either input_specs or example_inputs must be provided for TensorRT compile.")
             except Exception as exc:  # pragma: no cover - CUDA/TensorRT failure surface
                 self.disable(f"TensorRT compilation failed for {name}: {exc}")
                 raise
@@ -126,7 +146,11 @@ class TensorRTLatentDecoder:
             if engine is None:
                 input_spec = self.runtime.make_input_from_shape(tuple(latents.shape), name="latents")
                 try:
-                    engine = self.runtime.get_or_compile(f"vae_decode_{key}", self.wrapper, [input_spec])
+                engine = self.runtime.get_or_compile(
+                    f"vae_decode_{key}",
+                    self.wrapper,
+                    input_specs=[input_spec],
+                )
                 except Exception:
                     return self.fallback_fn(latents, self.vae)
                 self._cache[key] = engine
@@ -137,3 +161,51 @@ class TensorRTLatentDecoder:
             decoded = engine(latents_device)
 
         return decoded.to(dtype=torch.float32, device=latents.device)
+
+
+class _CallableModule(nn.Module):
+    def __init__(self, fn):
+        super().__init__()
+        self.fn = fn
+
+    def forward(self, *args, **kwargs):
+        return self.fn(*args, **kwargs)
+
+
+class TensorRTCallable:
+    """Wrap an arbitrary tensor-only callable and compile it on first use."""
+
+    def __init__(self, *, runtime: TensorRTRuntime, name: str, forward_fn):
+        self.runtime = runtime
+        self.name = name
+        self.forward_fn = forward_fn
+        self._module = _CallableModule(forward_fn)
+        self._compiled = None
+
+    def __call__(self, *args, **kwargs):
+        if not self.runtime.is_ready:
+            return self.forward_fn(*args, **kwargs)
+
+        # Only tensors are supported for TensorRT callable wrapper
+        if kwargs:
+            return self.forward_fn(*args, **kwargs)
+        if not all(torch.is_tensor(arg) for arg in args):
+            return self.forward_fn(*args, **kwargs)
+
+        if self._compiled is None:
+            example_args = tuple(
+                arg.detach().clone().to(device=self.runtime.device, dtype=self.runtime.compute_dtype) for arg in args
+            )
+            try:
+                self._compiled = self.runtime.get_or_compile(
+                    self.name,
+                    self._module,
+                    example_inputs=(example_args, {}),
+                )
+            except Exception:
+                return self.forward_fn(*args, **kwargs)
+
+        runtime_args = tuple(
+            arg.to(device=self.runtime.device, dtype=self.runtime.compute_dtype, non_blocking=True) for arg in args
+        )
+        return self._compiled(*runtime_args, **kwargs)

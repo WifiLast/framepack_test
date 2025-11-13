@@ -199,7 +199,7 @@ from diffusers_helper.inference import (
     prepare_module_for_inference,
     tensor_core_multiple_for_dtype,
 )
-from diffusers_helper.tensorrt_runtime import TensorRTRuntime, TensorRTLatentDecoder
+from diffusers_helper.tensorrt_runtime import TensorRTRuntime, TensorRTLatentDecoder, TensorRTCallable
 try:
     from third_party.fp8_optimization_utils import optimize_state_dict_with_fp8, apply_fp8_monkey_patch
 except ImportError:
@@ -1314,6 +1314,7 @@ if fp8_buffers_present:
 TENSORRT_RUNTIME = None
 TENSORRT_DECODER = None
 TENSORRT_AVAILABLE = False
+TENSORRT_SIGLIP_ENCODER = None
 if ENABLE_TENSORRT_RUNTIME:
     try:
         TENSORRT_RUNTIME = TensorRTRuntime(
@@ -1334,6 +1335,17 @@ if ENABLE_TENSORRT_RUNTIME:
         print(f"Failed to initialize TensorRT runtime: {exc}")
 else:
     print("TensorRT runtime disabled (use --enable-tensorrt to opt-in).")
+
+if TENSORRT_AVAILABLE and TENSORRT_RUNTIME is not None:
+    def _siglip_forward(pixel_values):
+        return image_encoder(pixel_values=pixel_values)
+
+    TENSORRT_SIGLIP_ENCODER = TensorRTCallable(
+        runtime=TENSORRT_RUNTIME,
+        name="siglip_image_encoder",
+        forward_fn=_siglip_forward,
+    )
+    setattr(image_encoder, "_framepack_trt_callable", TENSORRT_SIGLIP_ENCODER)
 
 if ENABLE_FP8 and optimize_state_dict_with_fp8 is not None and apply_fp8_monkey_patch is not None:
     if FP8_TRANSFORMER_ACTIVE:
@@ -1662,7 +1674,12 @@ def vae_decode_chunked(latents, vae, chunk_size=None, quality_mode=False, decode
                 with inference_autocast():
                     decoded = vae_decode(latents, vae)
             else:
-                decoded = decoder_fn(latents)
+                try:
+                    decoded = decoder_fn(latents)
+                except Exception as e:
+                    print(f"TensorRT decode failed, falling back to standard VAE: {e}")
+                    with inference_autocast():
+                        decoded = vae_decode(latents, vae)
             return decoded.cpu()
 
         chunks = []
@@ -1674,7 +1691,12 @@ def vae_decode_chunked(latents, vae, chunk_size=None, quality_mode=False, decode
                 with inference_autocast():
                     chunk_pixels = vae_decode(chunk_latents, vae)
             else:
-                chunk_pixels = decoder_fn(chunk_latents)
+                try:
+                    chunk_pixels = decoder_fn(chunk_latents)
+                except Exception as e:
+                    print(f"TensorRT decode failed for chunk {i}, falling back to standard VAE: {e}")
+                    with inference_autocast():
+                        chunk_pixels = vae_decode(chunk_latents, vae)
 
             # Move to CPU immediately and clear GPU memory
             chunks.append(chunk_pixels.cpu())
@@ -1759,6 +1781,7 @@ def worker(
     if use_tensorrt_decode and TENSORRT_AVAILABLE and TENSORRT_DECODER is not None:
         decoder_impl = TENSORRT_DECODER.decode
         print("TensorRT decoder engaged for this job.")
+        print("Note: TensorRT will compile separate engines for each unique chunk shape, which may cause slowdowns on first use.")
     transformer_backbone = getattr(transformer, "module", None)
     if transformer_backbone is None:
         transformer_backbone = globals().get("TRANSFORMER_BACKBONE", transformer)
