@@ -136,6 +136,10 @@ def _maybe_disable_flash_attn(exc: Exception, *, varlen: bool):
 def attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv):
     if cu_seqlens_q is None and cu_seqlens_kv is None and max_seqlen_q is None and max_seqlen_kv is None:
 
+        if sageattn is not None:
+            x = sageattn(q, k, v, tensor_layout='NHD')
+            return x
+
         if ATTN_ACCEL_MODE == "aggressive" and xformers_attn_func is not None:
             B, L, H, C = q.shape
             q_flat = q.permute(0, 2, 1, 3).reshape(B * H, L, C).contiguous()
@@ -158,10 +162,6 @@ def attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seq
 
         if xformers_attn_func is not None:
             x = xformers_attn_func(q, k, v)
-            return x
-
-        if sageattn is not None:
-            x = sageattn(q, k, v, tensor_layout='NHD')
             return x
 
         x = torch.nn.functional.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)).transpose(1, 2)
