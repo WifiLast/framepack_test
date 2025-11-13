@@ -199,6 +199,11 @@ from diffusers_helper.inference import (
     prepare_module_for_inference,
     tensor_core_multiple_for_dtype,
 )
+try:
+    from third_party.fp8_optimization_utils import optimize_state_dict_with_fp8, apply_fp8_monkey_patch
+except ImportError:
+    optimize_state_dict_with_fp8 = None
+    apply_fp8_monkey_patch = None
 
 try:
     import faiss  # type: ignore
@@ -1066,6 +1071,26 @@ def _resolve_cache_size(env_key, default):
         return default
 
 
+def _parse_csv_env(env_key: str):
+    raw = os.environ.get(env_key)
+    if not raw:
+        return None
+    values = [item.strip() for item in raw.split(",")]
+    values = [item for item in values if item]
+    return values or None
+
+
+FP8_UTILS_AVAILABLE = optimize_state_dict_with_fp8 is not None and apply_fp8_monkey_patch is not None
+ENABLE_FP8 = os.environ.get("FRAMEPACK_ENABLE_FP8", "0") == "1"
+if ENABLE_FP8 and not FP8_UTILS_AVAILABLE:
+    print('FRAMEPACK_ENABLE_FP8=1 but FP8 optimization utilities are unavailable -> disabling FP8 optimization.')
+    ENABLE_FP8 = False
+FP8_TARGET_LAYER_KEYS = _parse_csv_env("FRAMEPACK_FP8_TARGET_KEYS")
+FP8_EXCLUDE_LAYER_KEYS = _parse_csv_env("FRAMEPACK_FP8_EXCLUDE_KEYS")
+FP8_USE_SCALED_MM = os.environ.get("FRAMEPACK_FP8_USE_SCALED_MM", "0") == "1"
+FP8_TRANSFORMER_ACTIVE = False
+
+
 MODULE_CACHE_WRAPPERS: List[ModuleCacheWrapper] = []
 
 
@@ -1255,6 +1280,35 @@ text_encoder_2.eval()
 image_encoder.eval()
 transformer_core.eval()
 
+fp8_buffers_present = any(hasattr(module, "scale_weight") for module in transformer_core.modules())
+if fp8_buffers_present:
+    FP8_TRANSFORMER_ACTIVE = True
+
+if ENABLE_FP8 and optimize_state_dict_with_fp8 is not None and apply_fp8_monkey_patch is not None:
+    if FP8_TRANSFORMER_ACTIVE:
+        print('FP8 scale weights detected on transformer; skipping re-optimization.')
+    else:
+        fp8_device = gpu if torch.cuda.is_available() else None
+        fp8_state_dict = None
+        try:
+            fp8_state_dict = transformer_core.state_dict()
+            optimized_state = optimize_state_dict_with_fp8(
+                fp8_state_dict,
+                fp8_device,
+                target_layer_keys=FP8_TARGET_LAYER_KEYS,
+                exclude_layer_keys=FP8_EXCLUDE_LAYER_KEYS,
+                move_to_device=False,
+            )
+            apply_fp8_monkey_patch(transformer_core, optimized_state, use_scaled_mm=FP8_USE_SCALED_MM)
+            transformer_core.load_state_dict(optimized_state, strict=True)
+            FP8_TRANSFORMER_ACTIVE = True
+            print('Applied FP8 optimization to transformer weights.')
+        except Exception as exc:
+            print(f'FP8 optimization failed: {exc}')
+        finally:
+            if fp8_state_dict is not None:
+                del fp8_state_dict
+
 if ENABLE_FBCACHE:
     transformer_core.enable_first_block_cache(
         enabled=True,
@@ -1330,8 +1384,10 @@ if ENABLE_QUANT:
     manual_quant_targets = [vae, image_encoder]
     if not USE_BITSANDBYTES:
         manual_quant_targets.extend([text_encoder, text_encoder_2])
-    if not optimized_transformer_loaded:
+    if not optimized_transformer_loaded and not FP8_TRANSFORMER_ACTIVE:
         manual_quant_targets.append(transformer_core)
+    elif FP8_TRANSFORMER_ACTIVE:
+        print('FP8 optimization active -> skipping additional int-N quantization for transformer.')
 
     for module in manual_quant_targets:
         apply_int_nbit_quantization(module, num_bits=QUANT_BITS, target_dtype=MODEL_COMPUTE_DTYPE)
@@ -1341,7 +1397,10 @@ else:
         print('FRAMEPACK_ENABLE_QUANT not set -> skipping module quantization.')
     else:
         print('FRAMEPACK_ENABLE_QUANT=0 -> skipping module quantization.')
-    for module in (vae, image_encoder, transformer_core):
+    enforce_targets = [vae, image_encoder]
+    if not FP8_TRANSFORMER_ACTIVE:
+        enforce_targets.append(transformer_core)
+    for module in enforce_targets:
         enforce_low_precision(module, activation_dtype=MODEL_COMPUTE_DTYPE)
     if not USE_BITSANDBYTES:
         enforce_low_precision(text_encoder, activation_dtype=MODEL_COMPUTE_DTYPE)
