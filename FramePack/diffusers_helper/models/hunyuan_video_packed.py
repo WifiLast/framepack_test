@@ -48,30 +48,30 @@ if torch.backends.cuda.cudnn_sdp_enabled():
 print("Currently enabled native sdp backends:", enabled_backends)
 
 try:
-    # raise NotImplementedError
     from xformers.ops import memory_efficient_attention as xformers_attn_func
     print('Xformers is installed!')
-except:
+except Exception:
     print('Xformers is not installed!')
     xformers_attn_func = None
 
 try:
-    # raise NotImplementedError
     from flash_attn import flash_attn_varlen_func, flash_attn_func
     print('Flash Attn is installed!')
-except:
+except Exception:
     print('Flash Attn is not installed!')
     flash_attn_varlen_func = None
     flash_attn_func = None
 
 try:
-    # raise NotImplementedError
     from sageattention import sageattn_varlen, sageattn
     print('Sage Attn is installed!')
-except:
+except Exception:
     print('Sage Attn is not installed!')
     sageattn_varlen = None
     sageattn = None
+
+FLASH_ATTN_DISABLED = False
+FLASH_ATTN_VARLEN_DISABLED = False
 
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
@@ -121,6 +121,18 @@ def apply_rotary_emb_transposed(x, freqs_cis):
     return out
 
 
+def _maybe_disable_flash_attn(exc: Exception, *, varlen: bool):
+    global flash_attn_func, flash_attn_varlen_func, FLASH_ATTN_DISABLED, FLASH_ATTN_VARLEN_DISABLED
+    marker = "varlen" if varlen else "standard"
+    print(f'Flash Attention ({marker}) failed with "{exc}". Falling back to alternative kernels for the rest of this run.')
+    if varlen:
+        flash_attn_varlen_func = None
+        FLASH_ATTN_VARLEN_DISABLED = True
+    else:
+        flash_attn_func = None
+        FLASH_ATTN_DISABLED = True
+
+
 def attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv):
     if cu_seqlens_q is None and cu_seqlens_kv is None and max_seqlen_q is None and max_seqlen_kv is None:
 
@@ -138,8 +150,11 @@ def attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seq
             return out
 
         if flash_attn_func is not None:
-            x = flash_attn_func(q, k, v)
-            return x
+            try:
+                x = flash_attn_func(q, k, v)
+                return x
+            except Exception as exc:
+                _maybe_disable_flash_attn(exc, varlen=False)
 
         if xformers_attn_func is not None:
             x = xformers_attn_func(q, k, v)
@@ -161,7 +176,11 @@ def attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seq
     if sageattn_varlen is not None:
         x = sageattn_varlen(q, k, v, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv)
     elif flash_attn_varlen_func is not None:
-        x = flash_attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv)
+        try:
+            x = flash_attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv)
+        except Exception as exc:
+            _maybe_disable_flash_attn(exc, varlen=True)
+            return attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv)
     else:
         raise NotImplementedError('No Attn Installed!')
 
