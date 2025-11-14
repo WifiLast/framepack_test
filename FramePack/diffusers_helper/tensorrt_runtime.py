@@ -4,12 +4,15 @@ from typing import Any, Dict, Optional, Tuple
 import torch
 import torch.nn as nn
 
+_TORCH_TRT_IMPORT_ERROR: Optional[Exception]
 try:
     import torch_tensorrt
     from torch_tensorrt import Input as TRTInput
-except Exception:  # pragma: no cover - optional dependency
+    _TORCH_TRT_IMPORT_ERROR = None
+except Exception as exc:  # pragma: no cover - optional dependency
     torch_tensorrt = None
     TRTInput = None
+    _TORCH_TRT_IMPORT_ERROR = exc
 
 
 class TensorRTRuntime:
@@ -36,7 +39,10 @@ class TensorRTRuntime:
             self.failure_reason = "TensorRT runtime not requested."
             self.enabled = False
         elif torch_tensorrt is None:
-            self.failure_reason = "torch_tensorrt is not installed."
+            detail = ""
+            if _TORCH_TRT_IMPORT_ERROR is not None:
+                detail = f" (import error: {_TORCH_TRT_IMPORT_ERROR})"
+            self.failure_reason = f"torch_tensorrt is not available{detail}."
             self.enabled = False
         elif not torch.cuda.is_available():
             self.failure_reason = "CUDA device is required for TensorRT acceleration."
