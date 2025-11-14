@@ -233,6 +233,64 @@ def _map_nested_tensors(data, fn):
             _map_nested_tensors(x, fn)
             for x in data
         ]
+    # Handle objects with __dict__ BEFORE handling dict
+    # This ensures Hugging Face model outputs (which may inherit from dict) preserve all attributes
+    # Check for __dict__ but exclude basic Python types (not plain dict, as HF outputs may inherit from dict)
+    if hasattr(data, '__dict__') and not isinstance(data, (type, str, int, float, bool)) and type(data).__module__ not in ('builtins', '__builtin__'):
+        try:
+            # Use the object's __dict__ directly to capture all instance attributes
+            obj_dict = {}
+            for key, value in data.__dict__.items():
+                if not key.startswith('_'):
+                    obj_dict[key] = _map_nested_tensors(value, fn)
+
+            # If object also acts like a dict, handle that too
+            dict_items = {}
+            if hasattr(data, 'items') and callable(getattr(data, 'items')):
+                try:
+                    for k, v in data.items():
+                        if k not in obj_dict:  # Don't duplicate if already in __dict__
+                            dict_items[k] = _map_nested_tensors(v, fn)
+                except Exception:
+                    pass
+
+            # Create a new instance without calling __init__
+            # Try using the class's __new__ first, fall back if that fails
+            try:
+                reconstructed = type(data).__new__(type(data))
+            except TypeError:
+                # If __new__ requires arguments, try creating with empty args
+                try:
+                    reconstructed = type(data)()
+                except Exception:
+                    # Last resort: return the data as-is
+                    import sys
+                    print(f"DEBUG: Cannot create new instance of {type(data).__name__}, returning as-is", file=sys.stderr)
+                    return data
+
+            # Copy all attributes directly to __dict__
+            for key, value in obj_dict.items():
+                reconstructed.__dict__[key] = value
+            # Also copy dict items if present
+            for k, v in dict_items.items():
+                try:
+                    reconstructed[k] = v
+                except Exception:
+                    pass
+
+            # Debug logging for model outputs
+            if 'hidden_states' in data.__dict__:
+                import sys
+                print(f"DEBUG: Preserving object with hidden_states, type={type(data).__name__}", file=sys.stderr)
+                print(f"DEBUG: Original has hidden_states: {data.__dict__.get('hidden_states') is not None}", file=sys.stderr)
+                print(f"DEBUG: Reconstructed has hidden_states: {reconstructed.__dict__.get('hidden_states') is not None}", file=sys.stderr)
+
+            return reconstructed
+        except Exception as e:
+            # If reconstruction fails, log and return the data as-is
+            import sys
+            print(f"DEBUG: Failed to reconstruct object {type(data).__name__}: {e}", file=sys.stderr)
+            return data
     if isinstance(data, dict):
         mapped = {k: _map_nested_tensors(v, fn) for k, v in data.items()}
         try:
@@ -678,6 +736,7 @@ class ModuleCacheWrapper(torch.nn.Module):
             'cache_mode',
         }:
             return super().__getattr__(name)
+        # Delegate all other attributes to inner module (including device, dtype, etc.)
         return getattr(self.inner, name)
 
     def set_cache_mode(self, mode: str):
@@ -710,7 +769,13 @@ class ModuleCacheWrapper(torch.nn.Module):
         if self.forward_signature is not None:
             try:
                 bound = self.forward_signature.bind_partial(*args, **kwargs)
-                return dict(bound.arguments)
+                bound_dict = dict(bound.arguments)
+                # Also include any kwargs that weren't captured by bind_partial
+                # This handles cases like output_hidden_states that may not be in the explicit signature
+                for k, v in kwargs.items():
+                    if k not in bound_dict:
+                        bound_dict[k] = v
+                return bound_dict
             except Exception:
                 pass
         merged = {}
@@ -789,7 +854,19 @@ class ModuleCacheWrapper(torch.nn.Module):
                         cached = self.cache.get(match_key)
             if cached is not None:
                 return self._move_to_runtime(cached, runtime_device)
+
+        # Debug: Check what's being passed to the model
+        if 'output_hidden_states' in bound_args:
+            import sys
+            print(f"DEBUG: Calling {self.module_name} with output_hidden_states={bound_args.get('output_hidden_states')}", file=sys.stderr)
+            print(f"DEBUG: All bound_args keys: {list(bound_args.keys())}", file=sys.stderr)
+
         output = self.inner(**bound_args)
+
+        # Debug: Check what the model returned
+        if hasattr(output, 'hidden_states'):
+            import sys
+            print(f"DEBUG: Model {self.module_name} returned output with hidden_states={output.hidden_states is not None}", file=sys.stderr)
         if self.cache_mode != 'off':
             prepared = self._prepare_for_cache(output)
             self.cache.set(key, prepared)
@@ -858,7 +935,7 @@ if torch.cuda.is_available():
 
 torch.set_grad_enabled(False)
 
-DEFAULT_CACHE_MODE = os.environ.get("FRAMEPACK_MODULE_CACHE_MODE", "hash").lower()
+DEFAULT_CACHE_MODE = os.environ.get("FRAMEPACK_MODULE_CACHE_MODE", "semantic").lower()
 SEMANTIC_CACHE_THRESHOLD = float(os.environ.get("FRAMEPACK_SEMANTIC_CACHE_THRESHOLD", "0.985"))
 SEMANTIC_CACHE_THRESHOLD = max(0.0, min(1.0, SEMANTIC_CACHE_THRESHOLD))
 
@@ -1249,7 +1326,10 @@ if USE_BITSANDBYTES:
     )
 
 def _load_text_encoder():
-    return LlamaModel.from_pretrained(MODEL_REPO_SOURCE, subfolder='text_encoder', **text_encoder_kwargs)
+    model = LlamaModel.from_pretrained(MODEL_REPO_SOURCE, subfolder='text_encoder', **text_encoder_kwargs)
+    # Ensure the model config allows output_hidden_states
+    model.config.output_hidden_states = True
+    return model
 
 
 def _load_clip_text():
@@ -1293,11 +1373,19 @@ if PARALLEL_LOADERS > 1:
         text_encoder_2 = futures['text_encoder_2'].result()
         vae = futures['vae'].result()
         image_encoder = futures['image_encoder'].result()
+
+        # Enable output_hidden_states in model config
+        text_encoder.config.output_hidden_states = True
+        print("Set text_encoder.config.output_hidden_states = True")
 else:
     text_encoder = _load_component('text encoder', _load_text_encoder)
     text_encoder_2 = _load_component('clip text encoder', _load_clip_text)
     vae = _load_component('VAE', _load_vae)
     image_encoder = _load_component('SigLip image encoder', _load_image_encoder)
+
+# Enable output_hidden_states in model config
+text_encoder.config.output_hidden_states = True
+print("Set text_encoder.config.output_hidden_states = True")
 
 if not USE_BITSANDBYTES:
     text_encoder = text_encoder.cpu()
@@ -1332,11 +1420,14 @@ TENSORRT_AVAILABLE = False
 TENSORRT_SIGLIP_ENCODER = None
 if ENABLE_TENSORRT_RUNTIME:
     try:
+        # Allow custom TensorRT cache directory via environment variable
+        trt_cache_dir = os.environ.get('FRAMEPACK_TENSORRT_CACHE_DIR')
         TENSORRT_RUNTIME = TensorRTRuntime(
             enabled=True,
             precision=MODEL_COMPUTE_DTYPE if MODEL_COMPUTE_DTYPE in (torch.float16, torch.bfloat16) else torch.float16,
             workspace_size_mb=TRT_WORKSPACE_MB,
             max_aux_streams=TRT_MAX_AUX_STREAMS,
+            cache_dir=trt_cache_dir,
         )
         if TENSORRT_RUNTIME.is_ready:
             TENSORRT_DECODER = TensorRTLatentDecoder(vae, TENSORRT_RUNTIME, fallback_fn=vae_decode)
@@ -1561,17 +1652,18 @@ llama_semantic_embed = make_text_semantic_embedder(tokenizer)
 clip_semantic_embed = make_text_semantic_embedder(tokenizer_2)
 image_semantic_embed = make_image_semantic_embedder()
 
-text_encoder = wrap_with_module_cache(
-    text_encoder,
-    cache_name='text_encoder_llama',
-    normalization_tag='llama_prompt',
-    batched_arg_names=['input_ids', 'attention_mask'],
-    hash_input_names=['input_ids', 'attention_mask'],
-    default_cache_size=DEFAULT_CACHE_ITEMS,
-    cache_mode=CACHE_MODE,
-    semantic_embed_fn=llama_semantic_embed,
-    semantic_threshold=SEMANTIC_CACHE_THRESHOLD,
-)
+# Disable caching for text_encoder to avoid issues with output_hidden_states
+# The cache was not properly handling the output_hidden_states parameter
+""" text_encoder = wrap_with_module_cache(
+     text_encoder,
+     cache_name='text_encoder_llama',
+     normalization_tag='llama_prompt',
+     batched_arg_names=['input_ids', 'attention_mask'],
+     hash_input_names=['input_ids', 'attention_mask', 'output_hidden_states'],
+     default_cache_size=DEFAULT_CACHE_ITEMS,
+     cache_mode=CACHE_MODE,
+     semantic_embed_fn=llama_semantic_embed,
+     semantic_threshold=SEMANTIC_CACHE_THRESHOLD) """
 text_encoder_2 = wrap_with_module_cache(
     text_encoder_2,
     cache_name='text_encoder_clip',
@@ -2295,7 +2387,7 @@ with block:
                 rs = gr.Slider(label="CFG Re-Scale", minimum=0.0, maximum=1.0, value=0.0, step=0.01, visible=False)  # Should not change
 
             with gr.Accordion("Performance & Output", open=False):
-                gpu_memory_preservation = gr.Slider(label="GPU Inference Preserved Memory (GB) (larger means slower)", minimum=6, maximum=128, value=6, step=0.1, info="Set this number to a larger value if you encounter OOM. Larger value causes slower speed.")
+                gpu_memory_preservation = gr.Slider(label="GPU Inference Preserved Memory (GB) (larger means slower)", minimum=6, maximum=128, value=24, step=0.1, info="Set this number to a larger value if you encounter OOM. Larger value causes slower speed.")
                 mp4_crf = gr.Slider(label="MP4 Compression", minimum=0, maximum=100, value=16, step=1, info="Lower means better quality. 0 is uncompressed. Change to 16 if you get black outputs. ")
                 tensorrt_decode_checkbox = gr.Checkbox(
                     label="TensorRT VAE Acceleration (beta)",

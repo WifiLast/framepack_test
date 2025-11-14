@@ -17,6 +17,19 @@ class DynamicSwapInstaller:
         module.__dict__['forge_backup_original_class'] = original_class
 
         def hacked_get_attr(self, name: str):
+            # Handle device and dtype properties first - these are computed properties on nn.Module
+            if name == 'device':
+                # Get device from first parameter
+                try:
+                    return next(self.parameters()).device
+                except StopIteration:
+                    return torch.device('cpu')
+            if name == 'dtype':
+                # Get dtype from first parameter
+                try:
+                    return next(self.parameters()).dtype
+                except StopIteration:
+                    return torch.float32
             if '_parameters' in self.__dict__:
                 _parameters = self.__dict__['_parameters']
                 if name in _parameters:
@@ -33,8 +46,30 @@ class DynamicSwapInstaller:
                     return _buffers[name].to(**kwargs)
             return super(original_class, self).__getattr__(name)
 
+        # Also need to ensure forward() is called with all kwargs properly
+        original_forward = original_class.forward
+
+        def hacked_forward(self, *args, **kwargs):
+            # Debug logging for LlamaModel specifically
+            import sys
+            if 'LlamaModel' in original_class.__name__:
+                print(f"DEBUG hacked_forward ({original_class.__name__}): kwargs = {list(kwargs.keys())}", file=sys.stderr)
+                print(f"DEBUG hacked_forward: output_hidden_states = {kwargs.get('output_hidden_states', 'NOT SET')}", file=sys.stderr)
+                print(f"DEBUG hacked_forward: config.output_hidden_states = {getattr(self.config, 'output_hidden_states', 'NO CONFIG')}", file=sys.stderr)
+
+            result = original_forward(self, *args, **kwargs)
+
+            if 'LlamaModel' in original_class.__name__:
+                has_hs = hasattr(result, 'hidden_states')
+                hs_value = result.hidden_states if has_hs else 'NO ATTR'
+                hs_is_none = hs_value is None if has_hs else 'N/A'
+                print(f"DEBUG hacked_forward: result.hidden_states exists={has_hs}, is_none={hs_is_none}", file=sys.stderr)
+
+            return result
+
         module.__class__ = type('DynamicSwap_' + original_class.__name__, (original_class,), {
             '__getattr__': hacked_get_attr,
+            'forward': hacked_forward,
         })
 
     @staticmethod
@@ -44,7 +79,14 @@ class DynamicSwapInstaller:
 
     @staticmethod
     def install_model(model: torch.nn.Module, **kwargs: Any) -> None:
+        # Check if this is a LlamaModel that needs hidden_states support
+        is_llama = 'LlamaModel' in model.__class__.__name__
+
         for m in model.modules():
+            # For LlamaModel, skip wrapping the root model itself to avoid breaking hidden_states collection
+            # Only wrap the submodules for memory optimization
+            if is_llama and m is model:
+                continue
             DynamicSwapInstaller._install_module(m, **kwargs)
 
     @staticmethod

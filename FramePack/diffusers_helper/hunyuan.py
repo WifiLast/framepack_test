@@ -34,7 +34,15 @@ def encode_prompt_conds(prompt, text_encoder, text_encoder_2, tokenizer, tokeniz
         input_ids=llama_input_ids,
         attention_mask=llama_attention_mask,
         output_hidden_states=True,
+        return_dict=True,
     )
+
+    # Debug: Check if hidden_states is None
+    if llama_outputs.hidden_states is None:
+        print(f"ERROR: llama_outputs.hidden_states is None!")
+        print(f"llama_outputs type: {type(llama_outputs)}")
+        print(f"llama_outputs attributes: {list(vars(llama_outputs).keys())}")
+        raise RuntimeError(f"text_encoder returned output without hidden_states. Output type: {type(llama_outputs)}")
 
     llama_vec = llama_outputs.hidden_states[-3][:, crop_start:llama_attention_length]
     # llama_vec_remaining = llama_outputs.hidden_states[-3][:, llama_attention_length:]

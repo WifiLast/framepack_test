@@ -1,4 +1,7 @@
+import hashlib
+import os
 import threading
+from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 import torch
@@ -16,7 +19,7 @@ except Exception as exc:  # pragma: no cover - optional dependency
 
 
 class TensorRTRuntime:
-    """Small helper around torch_tensorrt to lazily compile modules."""
+    """Small helper around torch_tensorrt to lazily compile modules with disk caching."""
 
     def __init__(
         self,
@@ -25,6 +28,7 @@ class TensorRTRuntime:
         precision: torch.dtype = torch.float16,
         workspace_size_mb: int = 4096,
         max_aux_streams: int = 2,
+        cache_dir: Optional[str] = None,
     ):
         self.requested = bool(enabled)
         self.device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
@@ -34,6 +38,14 @@ class TensorRTRuntime:
         self.failure_reason: Optional[str] = None
         self._modules: Dict[str, torch.nn.Module] = {}
         self._lock = threading.Lock()
+
+        # Setup cache directory
+        if cache_dir is None:
+            cache_dir = os.path.join(os.path.dirname(__file__), '..', 'Cache', 'tensorrt_engines')
+        self.cache_dir = Path(cache_dir)
+        if self.requested:
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+            print(f"TensorRT cache directory: {self.cache_dir}")
 
         if not self.requested:
             self.failure_reason = "TensorRT runtime not requested."
@@ -59,6 +71,50 @@ class TensorRTRuntime:
     def is_ready(self) -> bool:
         return self.enabled
 
+    def _cache_key(self, name: str, input_shapes: Tuple[Tuple[int, ...], ...]) -> str:
+        """Generate a cache key from name and input shapes."""
+        # Include precision, workspace, and shapes in the key
+        key_str = f"{name}_dtype{self.compute_dtype}_ws{self.workspace_size}"
+        for shape in input_shapes:
+            key_str += f"_shape{'x'.join(map(str, shape))}"
+        # Hash to keep filename reasonable
+        return hashlib.sha256(key_str.encode()).hexdigest()[:16]
+
+    def _get_cache_path(self, cache_key: str) -> Path:
+        """Get the cache file path for a given key."""
+        return self.cache_dir / f"{cache_key}.pt"
+
+    def _load_from_cache(self, cache_key: str) -> Optional[torch.nn.Module]:
+        """Try to load a compiled module from disk cache."""
+        cache_path = self._get_cache_path(cache_key)
+        if not cache_path.exists():
+            return None
+
+        try:
+            print(f"Loading TensorRT engine from cache: {cache_path.name}")
+            # Load the TorchScript module
+            compiled = torch.jit.load(str(cache_path), map_location=self.device)
+            compiled.eval()
+            return compiled
+        except Exception as exc:
+            print(f"Warning: Failed to load cached TensorRT engine: {exc}")
+            # Remove corrupted cache file
+            try:
+                cache_path.unlink()
+            except:
+                pass
+            return None
+
+    def _save_to_cache(self, cache_key: str, module: torch.nn.Module) -> None:
+        """Save a compiled module to disk cache."""
+        cache_path = self._get_cache_path(cache_key)
+        try:
+            print(f"Saving TensorRT engine to cache: {cache_path.name}")
+            # Save as TorchScript
+            torch.jit.save(module, str(cache_path))
+        except Exception as exc:
+            print(f"Warning: Failed to save TensorRT engine to cache: {exc}")
+
     def make_input_from_shape(self, shape: Tuple[int, ...], *, name: Optional[str] = None) -> "TRTInput":
         if TRTInput is None:
             raise RuntimeError("torch_tensorrt.Input is unavailable.")
@@ -76,10 +132,32 @@ class TensorRTRuntime:
             raise RuntimeError(self.failure_reason or "TensorRT runtime disabled.")
 
         with self._lock:
+            # Check in-memory cache first
             existing = self._modules.get(name)
             if existing is not None:
                 return existing
 
+            # Extract input shapes for cache key
+            input_shapes = []
+            if input_specs is not None:
+                for spec in input_specs:
+                    if hasattr(spec, 'shape'):
+                        input_shapes.append(tuple(spec.shape))
+            elif example_inputs is not None:
+                example_args, _ = example_inputs
+                for arg in example_args:
+                    if torch.is_tensor(arg):
+                        input_shapes.append(tuple(arg.shape))
+
+            # Generate cache key and try to load from disk
+            cache_key = self._cache_key(name, tuple(input_shapes))
+            cached_module = self._load_from_cache(cache_key)
+            if cached_module is not None:
+                self._modules[name] = cached_module
+                return cached_module
+
+            # Not in cache, need to compile
+            print(f"Compiling TensorRT engine for {name} (this may take several minutes)...")
             module = module.to(device=self.device, dtype=self.compute_dtype)
             module.eval()
 
@@ -108,7 +186,9 @@ class TensorRTRuntime:
                 self.disable(f"TensorRT compilation failed for {name}: {exc}")
                 raise
 
+            # Save to both memory and disk cache
             self._modules[name] = compiled
+            self._save_to_cache(cache_key, compiled)
             return compiled
 
 
