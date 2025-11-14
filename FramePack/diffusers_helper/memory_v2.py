@@ -70,6 +70,8 @@ class DynamicSwapInstaller:
         original_class = module.__class__
         module.__dict__['forge_backup_original_class'] = original_class
 
+        original_getattr = original_class.__dict__.get('__getattr__')
+
         def hacked_get_attr(self, name: str):
             if '_parameters' in self.__dict__:
                 _parameters = self.__dict__['_parameters']
@@ -85,6 +87,8 @@ class DynamicSwapInstaller:
                 _buffers = self.__dict__['_buffers']
                 if name in _buffers:
                     return _buffers[name].to(**kwargs)
+            if original_getattr is not None:
+                return original_getattr(self, name)
             return super(original_class, self).__getattr__(name)
 
         module.__class__ = type('DynamicSwap_' + original_class.__name__, (original_class,), {

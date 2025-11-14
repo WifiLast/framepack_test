@@ -13,11 +13,12 @@ FRAMEPACK_FAST_START=1 FRAMEPACK_PRELOAD_REPOS=0 FRAMEPACK_USE_BNB=1 FRAMEPACK_B
 # Standard mit BNB 4-bit + Memory V2:
 #FRAMEPACK_PRELOAD_REPOS=0 FRAMEPACK_FAST_START=1 FRAMEPACK_USE_BNB=1 FRAMEPACK_BNB_LOAD_IN_4BIT=1 FRAMEPACK_BNB_CPU_OFFLOAD=1 FRAMEPACK_VAE_CHUNK_SIZE=2 python demo_gradio.py --fast-start --xformers-mode standard  --use-memory-v2
 
+FRAMEPACK_USE_BNB=1                      # Enable BitsAndBytes (incompatible with TensorRT)
+FRAMEPACK_BNB_LOAD_IN_4BIT=1             # 4-bit quantization (incompatible with TensorRT)
+FRAMEPACK_BNB_CPU_OFFLOAD=1              # CPU offload (incompatible with TensorRT)
+
 # Mit TensorRT (Flash Attention deaktivieren, um CUDA-Fehler zu vermeiden):
-#PYTORCH_ENABLE_MEM_EFFICIENT_SDP=0 PYTORCH_ENABLE_FLASH_SDP=0 FRAMEPACK_PRELOAD_REPOS=0 FRAMEPACK_FAST_START=1 FRAMEPACK_USE_BNB=1 FRAMEPACK_BNB_LOAD_IN_4BIT=1 FRAMEPACK_BNB_CPU_OFFLOAD=1 FRAMEPACK_VAE_CHUNK_SIZE=2 python demo_gradio.py --fast-start --xformers-mode aggressive --use-memory-v2 --enable-tensorrt --tensorrt-transformer
+#PYTORCH_ENABLE_MEM_EFFICIENT_SDP=0 PYTORCH_ENABLE_FLASH_SDP=0 FRAMEPACK_PRELOAD_REPOS=0 FRAMEPACK_FAST_START=0 FRAMEPACK_USE_BNB=0 FRAMEPACK_BNB_LOAD_IN_4BIT=0 FRAMEPACK_BNB_CPU_OFFLOAD=1 FRAMEPACK_VAE_CHUNK_SIZE=2 python demo_gradio.py --fast-start --xformers-mode aggressive --use-memory-v2 --enable-tensorrt --tensorrt-transformer
 
 
-python demo_gradio.py \
-  --enable-tensorrt \
-  --tensorrt-transformer \
-  --use-memory-v2
+python demo_gradio.py --fast-start --enable-tensorrt --tensorrt-transformer --use-memory-v2
