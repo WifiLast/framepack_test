@@ -1487,6 +1487,63 @@ if TENSORRT_AVAILABLE and TENSORRT_RUNTIME is not None:
     )
     setattr(image_encoder, "_framepack_trt_callable", TENSORRT_SIGLIP_ENCODER)
 
+    # Check and convert models to ONNX if needed for TensorRT
+    if TRT_TEXT_ENCODERS_ENABLED or TRT_TRANSFORMER_ENABLED:
+        try:
+            from diffusers_helper.onnx_converter import (
+                prepare_text_encoder_for_tensorrt,
+                prepare_clip_text_encoder_for_tensorrt,
+                prepare_transformer_for_tensorrt,
+            )
+
+            print("\n" + "="*80)
+            print("TensorRT Model Preparation: Checking ONNX conversion status")
+            print("="*80)
+
+            # Prepare text encoders if needed
+            if TRT_TEXT_ENCODERS_ENABLED:
+                print("\nChecking LLAMA text encoder...")
+                text_encoder_temp = text_encoder.to('cuda')
+                llama_onnx_path = prepare_text_encoder_for_tensorrt(text_encoder_temp, device='cuda')
+                text_encoder_temp = text_encoder_temp.cpu()
+
+                if llama_onnx_path is None:
+                    print("WARNING: LLAMA text encoder ONNX conversion failed. TensorRT text encoder will be disabled.")
+                else:
+                    print(f"LLAMA text encoder ready for TensorRT: {llama_onnx_path}")
+
+                print("\nChecking CLIP text encoder...")
+                clip_encoder_temp = text_encoder_2.to('cuda')
+                clip_onnx_path = prepare_clip_text_encoder_for_tensorrt(clip_encoder_temp, device='cuda')
+                clip_encoder_temp = clip_encoder_temp.cpu()
+
+                if clip_onnx_path is None:
+                    print("WARNING: CLIP text encoder ONNX conversion failed. TensorRT text encoder will be disabled.")
+                else:
+                    print(f"CLIP text encoder ready for TensorRT: {clip_onnx_path}")
+
+            # Prepare transformer if needed
+            if TRT_TRANSFORMER_ENABLED:
+                print("\nChecking transformer model...")
+                transformer_temp = transformer_core.to('cuda')
+                transformer_onnx_path = prepare_transformer_for_tensorrt(transformer_temp, device='cuda')
+                transformer_temp = transformer_temp.cpu()
+
+                if transformer_onnx_path is None:
+                    print("WARNING: Transformer ONNX conversion failed. TensorRT transformer will be disabled.")
+                else:
+                    print(f"Transformer ready for TensorRT: {transformer_onnx_path}")
+
+            print("="*80)
+            print("ONNX preparation complete. TensorRT will compile engines on first use.")
+            print("="*80 + "\n")
+
+        except Exception as exc:
+            print(f"Failed to prepare models for TensorRT: {exc}")
+            import traceback
+            traceback.print_exc()
+            print("Continuing with PyTorch models (TensorRT may not work optimally)")
+
     if TRT_TEXT_ENCODERS_ENABLED:
         try:
             print("Initializing TensorRT text encoders...")

@@ -249,13 +249,13 @@ class TensorRTLatentDecoder:
             engine = self._cache.get(key)
             if engine is None:
                 input_spec = self.runtime.make_input_from_shape(tuple(latents.shape), name="latents")
-                try:
-                    engine = self.runtime.get_or_compile(
-                        f"vae_decode_{key}",
-                        self.wrapper,
-                        input_specs=[input_spec],
-                    )
-                except Exception:
+                engine = self.runtime.get_or_compile(
+                    f"vae_decode_{key}",
+                    self.wrapper,
+                    input_specs=[input_spec],
+                )
+                if engine is None:
+                    # Compilation failed - fall back to PyTorch
                     return self.fallback_fn(latents, self.vae)
                 self._cache[key] = engine
 
@@ -306,13 +306,13 @@ class TensorRTLatentEncoder:
             engine = self._cache.get(key)
             if engine is None:
                 input_spec = self.runtime.make_input_from_shape(tuple(sample.shape), name="pixels")
-                try:
-                    engine = self.runtime.get_or_compile(
-                        f"vae_encode_{key}",
-                        self.wrapper,
-                        input_specs=[input_spec],
-                    )
-                except Exception:
+                engine = self.runtime.get_or_compile(
+                    f"vae_encode_{key}",
+                    self.wrapper,
+                    input_specs=[input_spec],
+                )
+                if engine is None:
+                    # Compilation failed - fall back to PyTorch
                     return self.fallback_fn(sample, self.vae)
                 self._cache[key] = engine
 
@@ -363,13 +363,13 @@ class TensorRTCallable:
             example_args = tuple(
                 arg.detach().clone().to(device=self.runtime.device, dtype=self.runtime.compute_dtype) for arg in args
             )
-            try:
-                self._compiled = self.runtime.get_or_compile(
-                    self.name,
-                    self._module,
-                    example_inputs=(example_args, {}),
-                )
-            except Exception:
+            self._compiled = self.runtime.get_or_compile(
+                self.name,
+                self._module,
+                example_inputs=(example_args, {}),
+            )
+            if self._compiled is None:
+                # Compilation failed - fall back to PyTorch
                 return self.forward_fn(*args, **kwargs)
 
         runtime_args = tuple(
@@ -528,35 +528,31 @@ class TensorRTTransformer:
 
                 # Compile new engine for this shape
                 print(f"Compiling TensorRT transformer engine for shape: {key}")
-                try:
-                    # Create input specs for all inputs
-                    input_specs = [
-                        self.runtime.make_input_from_shape(hidden_states.shape, name="hidden_states"),
-                        self.runtime.make_input_from_shape(timestep.shape, name="timestep"),
-                        self.runtime.make_input_from_shape(encoder_hidden_states.shape, name="encoder_hidden_states"),
-                        self.runtime.make_input_from_shape(encoder_attention_mask.shape, name="encoder_attention_mask"),
-                        self.runtime.make_input_from_shape(pooled_projections.shape, name="pooled_projections"),
-                        self.runtime.make_input_from_shape(guidance.shape, name="guidance"),
-                        self.runtime.make_input_from_shape(latent_indices.shape, name="latent_indices"),
-                        self.runtime.make_input_from_shape(clean_latents.shape, name="clean_latents"),
-                        self.runtime.make_input_from_shape(clean_latent_indices.shape, name="clean_latent_indices"),
-                        self.runtime.make_input_from_shape(clean_latents_2x.shape, name="clean_latents_2x"),
-                        self.runtime.make_input_from_shape(clean_latent_2x_indices.shape, name="clean_latent_2x_indices"),
-                        self.runtime.make_input_from_shape(clean_latents_4x.shape, name="clean_latents_4x"),
-                        self.runtime.make_input_from_shape(clean_latent_4x_indices.shape, name="clean_latent_4x_indices"),
-                        self.runtime.make_input_from_shape(image_embeddings.shape, name="image_embeddings"),
-                    ]
+                # Create input specs for all inputs
+                input_specs = [
+                    self.runtime.make_input_from_shape(hidden_states.shape, name="hidden_states"),
+                    self.runtime.make_input_from_shape(timestep.shape, name="timestep"),
+                    self.runtime.make_input_from_shape(encoder_hidden_states.shape, name="encoder_hidden_states"),
+                    self.runtime.make_input_from_shape(encoder_attention_mask.shape, name="encoder_attention_mask"),
+                    self.runtime.make_input_from_shape(pooled_projections.shape, name="pooled_projections"),
+                    self.runtime.make_input_from_shape(guidance.shape, name="guidance"),
+                    self.runtime.make_input_from_shape(latent_indices.shape, name="latent_indices"),
+                    self.runtime.make_input_from_shape(clean_latents.shape, name="clean_latents"),
+                    self.runtime.make_input_from_shape(clean_latent_indices.shape, name="clean_latent_indices"),
+                    self.runtime.make_input_from_shape(clean_latents_2x.shape, name="clean_latents_2x"),
+                    self.runtime.make_input_from_shape(clean_latent_2x_indices.shape, name="clean_latent_2x_indices"),
+                    self.runtime.make_input_from_shape(clean_latents_4x.shape, name="clean_latents_4x"),
+                    self.runtime.make_input_from_shape(clean_latent_4x_indices.shape, name="clean_latent_4x_indices"),
+                    self.runtime.make_input_from_shape(image_embeddings.shape, name="image_embeddings"),
+                ]
 
-                    engine = self.runtime.get_or_compile(
-                        f"transformer_{self._compile_count}",
-                        self.wrapper,
-                        input_specs=input_specs,
-                    )
-                    self._compile_count += 1
-                    self._cache[key] = engine
-                    print(f"TensorRT transformer compilation successful")
-                except Exception as exc:
-                    print(f"TensorRT transformer compilation failed: {exc}")
+                engine = self.runtime.get_or_compile(
+                    f"transformer_{self._compile_count}",
+                    self.wrapper,
+                    input_specs=input_specs,
+                )
+                if engine is None:
+                    print(f"TensorRT transformer compilation failed - falling back to PyTorch")
                     # Fall back to original implementation
                     if self.fallback_fn is not None:
                         return self.fallback_fn(
@@ -595,6 +591,10 @@ class TensorRTTransformer:
                         attention_kwargs=attention_kwargs or {},
                         return_dict=return_dict,
                     )
+
+                self._compile_count += 1
+                self._cache[key] = engine
+                print(f"TensorRT transformer compilation successful")
 
         # Execute with TensorRT engine
         with torch.no_grad():
