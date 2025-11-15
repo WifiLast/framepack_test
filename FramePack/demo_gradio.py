@@ -1001,6 +1001,11 @@ TRT_TRANSFORMER_ENABLED = args.tensorrt_transformer
 TRT_TEXT_ENCODERS_ENABLED = args.tensorrt_text_encoders
 TRT_MAX_CACHED_SHAPES = int(os.environ.get("FRAMEPACK_TRT_MAX_CACHED_SHAPES", "8"))
 ENABLE_TENSORRT_RUNTIME = args.enable_tensorrt
+
+print(f"DEBUG: ENABLE_TENSORRT_RUNTIME = {ENABLE_TENSORRT_RUNTIME}")
+print(f"DEBUG: TRT_TRANSFORMER_ENABLED = {TRT_TRANSFORMER_ENABLED}")
+print(f"DEBUG: TRT_TEXT_ENCODERS_ENABLED = {TRT_TEXT_ENCODERS_ENABLED}")
+
 if TRT_TEXT_ENCODERS_ENABLED and not ENABLE_TENSORRT_RUNTIME:
     print("TensorRT text encoders requested but TensorRT runtime disabled; ignoring flag.")
     TRT_TEXT_ENCODERS_ENABLED = False
@@ -1435,10 +1440,13 @@ TENSORRT_DECODER = None
 TENSORRT_ENCODER = None
 TENSORRT_AVAILABLE = False
 TENSORRT_SIGLIP_ENCODER = None
+print(f"DEBUG: About to check ENABLE_TENSORRT_RUNTIME = {ENABLE_TENSORRT_RUNTIME}")
 if ENABLE_TENSORRT_RUNTIME:
+    print("DEBUG: Entering TensorRT initialization block")
     try:
         # Allow custom TensorRT cache directory via environment variable
         trt_cache_dir = os.environ.get('FRAMEPACK_TENSORRT_CACHE_DIR')
+        print(f"DEBUG: Creating TensorRTRuntime with workspace={TRT_WORKSPACE_MB} MB")
         TENSORRT_RUNTIME = TensorRTRuntime(
             enabled=True,
             precision=MODEL_COMPUTE_DTYPE if MODEL_COMPUTE_DTYPE in (torch.float16, torch.bfloat16) else torch.float16,
