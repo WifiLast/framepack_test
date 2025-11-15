@@ -200,14 +200,31 @@ def apply_int_nbit_quantization(module: nn.Module, num_bits: int = 8, target_dty
 
 
 def enforce_low_precision(module: nn.Module, activation_dtype: torch.dtype = torch.float16) -> None:
-    for param in module.parameters(recurse=False):
-        if torch.is_floating_point(param):
-            param.data = param.data.to(dtype=activation_dtype)
-    for name, buffer in list(module.named_buffers(recurse=False)):
-        if torch.is_floating_point(buffer):
-            setattr(module, name, buffer.to(dtype=activation_dtype))
+    import gc
+    try:
+        for param in module.parameters(recurse=False):
+            if torch.is_floating_point(param):
+                param.data = param.data.to(dtype=activation_dtype)
+    except Exception as exc:
+        # Some models have problematic parameter structures
+        print(f"Warning: Failed to convert parameters for {type(module).__name__}: {exc}")
+
+    try:
+        for name, buffer in list(module.named_buffers(recurse=False)):
+            if torch.is_floating_point(buffer):
+                try:
+                    setattr(module, name, buffer.to(dtype=activation_dtype))
+                except Exception:
+                    # Skip buffers that can't be converted
+                    pass
+    except Exception as exc:
+        # Some models have problematic buffer structures
+        print(f"Warning: Failed to convert buffers for {type(module).__name__}: {exc}")
+
     for child in module.children():
         enforce_low_precision(child, activation_dtype=activation_dtype)
+    # Periodically clean up to avoid memory spikes in large models
+    gc.collect()
 
 
 def _select_indices(length: int, target_len: int) -> List[int]:

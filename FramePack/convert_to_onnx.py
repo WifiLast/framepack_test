@@ -70,12 +70,68 @@ def load_flux_redux_model(model_path: str) -> Tuple[nn.Module, dict]:
         print("Attempting to load as raw PyTorch model...")
 
         # Try loading as raw PyTorch checkpoint
-        checkpoint_files = list(Path(model_path).glob("*.pt")) + list(Path(model_path).glob("*.pth"))
+        model_path_obj = Path(model_path)
+        checkpoint_files = list(model_path_obj.glob("*.pt")) + list(model_path_obj.glob("*.pth"))
+
         if checkpoint_files:
+            print(f"  Found checkpoint file: {checkpoint_files[0]}")
             model = torch.load(checkpoint_files[0], map_location='cpu')
             return model, {}
 
-        raise RuntimeError(f"Could not load model from {model_path}")
+        # Check if this is a HuggingFace cache directory with snapshots
+        snapshots_dir = model_path_obj / "snapshots"
+        print(f"\nDEBUG: Checking for snapshots directory: {snapshots_dir}")
+        print(f"  snapshots_dir.exists() = {snapshots_dir.exists()}")
+
+        if snapshots_dir.exists():
+            print(f"  Found snapshots directory, checking for model files...")
+            snapshot_dirs = [d for d in snapshots_dir.iterdir() if d.is_dir()]
+            print(f"  Found {len(snapshot_dirs)} snapshot directories")
+
+            if snapshot_dirs:
+                # Use the first (and usually only) snapshot
+                snapshot_path = snapshot_dirs[0]
+                print(f"  Trying snapshot: {snapshot_path}")
+
+                # List contents of snapshot
+                print(f"  Snapshot contents:")
+                for item in snapshot_path.iterdir():
+                    print(f"    - {item.name}")
+
+                try:
+                    config = AutoConfig.from_pretrained(str(snapshot_path), trust_remote_code=True)
+                    model = AutoModel.from_pretrained(
+                        str(snapshot_path),
+                        config=config,
+                        trust_remote_code=True,
+                        torch_dtype=torch.float16,
+                    )
+                    model.eval()
+                    config_dict = {
+                        'hidden_size': getattr(config, 'hidden_size', 768),
+                        'num_layers': getattr(config, 'num_hidden_layers', 12),
+                    }
+                    return model, config_dict
+                except Exception as snapshot_e:
+                    print(f"  Failed to load from snapshot: {snapshot_e}")
+                    import traceback
+                    traceback.print_exc()
+            else:
+                print(f"  WARNING: snapshots directory is empty or contains no subdirectories")
+
+        # List what's actually in the directory for debugging
+        print(f"\nDEBUG: Contents of {model_path}:")
+        try:
+            for item in model_path_obj.iterdir():
+                print(f"  - {item.name}")
+        except Exception:
+            pass
+
+        raise RuntimeError(f"Could not load model from {model_path}\n"
+                         f"Expected either:\n"
+                         f"  - config.json + model files (*.safetensors, *.bin)\n"
+                         f"  - PyTorch checkpoint (*.pt, *.pth)\n"
+                         f"  - HuggingFace cache with snapshots/ subdirectory")
 
 
 def load_diffusers_model(model_path: str, subfolder: Optional[str] = None) -> Tuple[nn.Module, dict]:
@@ -182,19 +238,21 @@ def load_text_encoder(model_path: str, encoder_type: str = 'clip') -> Tuple[nn.M
 
 
 def get_sample_inputs_flux_redux(model: nn.Module, config: dict, device: str = 'cuda') -> Tuple[Any, ...]:
-    """Generate sample inputs for Flux Redux model."""
+    """Generate sample inputs for Flux Redux model (SiglipVisionModel expects pixel values)."""
     batch_size = 1
-    seq_length = 256
-    hidden_size = config.get('hidden_size', 768)
 
-    # Generic image embedding input
-    image_embeddings = torch.randn(
-        batch_size, seq_length, hidden_size,
+    # SiglipVisionModel expects pixel_values input (images)
+    # Default Siglip image size is 384x384 with 3 channels
+    image_size = 384
+    num_channels = 3
+
+    pixel_values = torch.randn(
+        batch_size, num_channels, image_size, image_size,
         dtype=torch.float16,
         device=device
     )
 
-    return (image_embeddings,)
+    return (pixel_values,)
 
 
 def get_sample_inputs_text_encoder(model: nn.Module, config: dict, device: str = 'cuda') -> Tuple[Any, ...]:
@@ -300,7 +358,7 @@ def convert_model_to_onnx(
     }
 
     input_names_map = {
-        'flux_redux': ['image_embeddings'],
+        'flux_redux': ['pixel_values'],
         'clip_text': ['input_ids', 'attention_mask'],
         'llama_text': ['input_ids', 'attention_mask'],
         't5_text': ['input_ids', 'attention_mask'],
@@ -311,7 +369,7 @@ def convert_model_to_onnx(
     }
 
     output_names_map = {
-        'flux_redux': ['output'],
+        'flux_redux': ['last_hidden_state', 'pooler_output'],
         'clip_text': ['last_hidden_state', 'pooler_output'],
         'llama_text': ['last_hidden_state'],
         't5_text': ['last_hidden_state'],

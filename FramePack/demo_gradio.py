@@ -207,6 +207,7 @@ from diffusers_helper.tensorrt_runtime import (
     TensorRTTransformer,
     TensorRTTextEncoder,
     TensorRTCLIPTextEncoder,
+    _TORCH_TRT_IMPORT_ERROR,
 )
 from diffusers_helper.cache_events import CacheEventRecorder
 try:
@@ -1441,6 +1442,9 @@ TENSORRT_ENCODER = None
 TENSORRT_AVAILABLE = False
 TENSORRT_SIGLIP_ENCODER = None
 print(f"DEBUG: About to check ENABLE_TENSORRT_RUNTIME = {ENABLE_TENSORRT_RUNTIME}")
+if _TORCH_TRT_IMPORT_ERROR is not None:
+    print(f"WARNING: torch_tensorrt import failed: {_TORCH_TRT_IMPORT_ERROR}")
+    print("TensorRT features will be disabled. Install torch-tensorrt to enable.")
 if ENABLE_TENSORRT_RUNTIME:
     print("DEBUG: Entering TensorRT initialization block")
     try:
@@ -1456,6 +1460,8 @@ if ENABLE_TENSORRT_RUNTIME:
         )
         print(f"DEBUG: TENSORRT_RUNTIME.is_ready = {TENSORRT_RUNTIME.is_ready}")
         print(f"DEBUG: TENSORRT_RUNTIME.enabled = {TENSORRT_RUNTIME.enabled}")
+        if TENSORRT_RUNTIME.failure_reason:
+            print(f"DEBUG: TENSORRT_RUNTIME.failure_reason = {TENSORRT_RUNTIME.failure_reason}")
         if TENSORRT_RUNTIME.is_ready:
             TENSORRT_DECODER = TensorRTLatentDecoder(vae, TENSORRT_RUNTIME, fallback_fn=vae_decode)
             TENSORRT_ENCODER = TensorRTLatentEncoder(vae, TENSORRT_RUNTIME, fallback_fn=vae_encode)
@@ -1476,16 +1482,25 @@ else:
 TENSORRT_TRANSFORMER = None
 TENSORRT_LLAMA_TEXT_ENCODER = None
 TENSORRT_CLIP_TEXT_ENCODER = None
+TENSORRT_SIGLIP_ENCODER = None
 if TENSORRT_AVAILABLE and TENSORRT_RUNTIME is not None:
-    def _siglip_forward(pixel_values):
-        return image_encoder(pixel_values=pixel_values)
+    try:
+        print("DEBUG: Creating TensorRT SiGLIP encoder wrapper...")
+        def _siglip_forward(pixel_values):
+            return image_encoder(pixel_values=pixel_values)
 
-    TENSORRT_SIGLIP_ENCODER = TensorRTCallable(
-        runtime=TENSORRT_RUNTIME,
-        name="siglip_image_encoder",
-        forward_fn=_siglip_forward,
-    )
-    setattr(image_encoder, "_framepack_trt_callable", TENSORRT_SIGLIP_ENCODER)
+        TENSORRT_SIGLIP_ENCODER = TensorRTCallable(
+            runtime=TENSORRT_RUNTIME,
+            name="siglip_image_encoder",
+            forward_fn=_siglip_forward,
+        )
+        setattr(image_encoder, "_framepack_trt_callable", TENSORRT_SIGLIP_ENCODER)
+        print("DEBUG: TensorRT SiGLIP encoder wrapper created successfully")
+    except Exception as exc:
+        print(f"WARNING: Failed to create TensorRT SiGLIP encoder wrapper: {exc}")
+        import traceback
+        traceback.print_exc()
+        TENSORRT_SIGLIP_ENCODER = None
 
     # Check and convert models to ONNX if needed for TensorRT
     if TRT_TEXT_ENCODERS_ENABLED or TRT_TRANSFORMER_ENABLED:
@@ -1733,19 +1748,38 @@ else:
         print('FRAMEPACK_ENABLE_QUANT not set -> skipping module quantization.')
     else:
         print('FRAMEPACK_ENABLE_QUANT=0 -> skipping module quantization.')
+    print('DEBUG: About to enforce low precision on modules...')
     enforce_targets = [vae, image_encoder]
     if not FP8_TRANSFORMER_ACTIVE:
         enforce_targets.append(transformer_core)
-    for module in enforce_targets:
+    print(f'DEBUG: enforce_targets has {len(enforce_targets)} modules')
+    for i, module in enumerate(enforce_targets):
+        print(f'DEBUG: Enforcing low precision on module {i+1}/{len(enforce_targets)}...')
         enforce_low_precision(module, activation_dtype=MODEL_COMPUTE_DTYPE)
+        print(f'DEBUG: Completed module {i+1}/{len(enforce_targets)}')
+        # Force memory cleanup after each module
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    print('DEBUG: enforce_targets complete')
     if not USE_BITSANDBYTES:
-        enforce_low_precision(text_encoder, activation_dtype=MODEL_COMPUTE_DTYPE)
-        enforce_low_precision(text_encoder_2, activation_dtype=MODEL_COMPUTE_DTYPE)
+        print('DEBUG: Processing text encoders (skipping problematic dtype conversion)...')
+        # NOTE: Text encoders are already loaded with torch_dtype=torch.float16 (line 1337)
+        # Calling .to(dtype=...) on these large models causes segfaults/crashes
+        # Skip the conversion since they're already in the correct dtype
+        print(f'DEBUG: text_encoder type: {type(text_encoder).__name__}')
+        print(f'DEBUG: text_encoder_2 type: {type(text_encoder_2).__name__}')
+        print('DEBUG: Text encoders already in correct dtype (float16), skipping conversion')
+        print('DEBUG: Text encoders complete')
 
+print('DEBUG: Reached compilation check point')
 if torch.cuda.is_available() and not FAST_START and ENABLE_COMPILE:
+    print('DEBUG: Starting module compilation...')
     if not USE_BITSANDBYTES:
+        print('DEBUG: Compiling text_encoder...')
         text_encoder = maybe_compile_module(text_encoder, mode="reduce-overhead", dynamic=False)
+        print('DEBUG: Compiling text_encoder_2...')
         text_encoder_2 = maybe_compile_module(text_encoder_2, mode="reduce-overhead", dynamic=False)
+        print('DEBUG: Text encoders compiled')
     image_encoder = maybe_compile_module(image_encoder, mode="reduce-overhead", dynamic=False)
 elif not ENABLE_COMPILE:
     print('FRAMEPACK_ENABLE_COMPILE=0 -> skipping torch.compile for encoders.')
