@@ -98,6 +98,20 @@ def export_model_to_onnx(
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
+        # Determine target device from sample inputs
+        target_device = None
+        for inp in sample_inputs:
+            if torch.is_tensor(inp):
+                target_device = inp.device
+                break
+
+        # Move all model buffers and parameters to target device
+        if target_device is not None and target_device.type == 'cuda':
+            print(f"  Ensuring all model components are on {target_device}...")
+            for name, buffer in model.named_buffers():
+                if buffer.device != target_device:
+                    buffer.data = buffer.data.to(target_device)
+
         # Export to ONNX
         # Disable dynamo to avoid dynamic_axes/dynamic_shapes conflict
         with torch.inference_mode():
@@ -252,6 +266,101 @@ def prepare_image_encoder_for_tensorrt(image_encoder: nn.Module, device: str = '
     return ensure_model_is_onnx_compatible(
         model=image_encoder,
         model_name='siglip_image_encoder',
+        sample_input_fn=get_sample_inputs,
+        input_names=input_names,
+        output_names=output_names,
+        dynamic_axes=dynamic_axes,
+    )
+
+
+def prepare_vae_decoder_for_tensorrt(
+    vae: nn.Module,
+    device: str = 'cuda',
+    sample_latent_shape: Tuple[int, int, int, int, int] = (1, 16, 1, 45, 80)  # B, C, F, H, W
+) -> Optional[Path]:
+    """Prepare VAE decoder for TensorRT by ensuring ONNX model exists."""
+
+    def get_sample_inputs():
+        # VAE decoder expects latents with shape [batch, channels, frames, height, width]
+        latents = torch.randn(*sample_latent_shape, dtype=torch.float16, device=device)
+        return (latents,)
+
+    # Create a wrapper that includes the scaling factor
+    class VAEDecoderWrapper(nn.Module):
+        def __init__(self, vae_model, target_device):
+            super().__init__()
+            self.vae = vae_model
+            self.scale = float(getattr(vae_model.config, "scaling_factor", 1.0))
+            self.target_device = torch.device(target_device)
+
+        def forward(self, latents: torch.Tensor) -> torch.Tensor:
+            # Ensure input is on correct device
+            latents = latents.to(self.target_device)
+            latents = latents / self.scale
+            decoded = self.vae.decode(latents).sample
+            return decoded
+
+    wrapper = VAEDecoderWrapper(vae, device)
+    wrapper.eval()
+
+    input_names = ['latents']
+    output_names = ['decoded_sample']
+    dynamic_axes = {
+        'latents': {0: 'batch', 2: 'frames', 3: 'height', 4: 'width'},
+        'decoded_sample': {0: 'batch', 2: 'frames', 3: 'height', 4: 'width'},
+    }
+
+    return ensure_model_is_onnx_compatible(
+        model=wrapper,
+        model_name='vae_decoder',
+        sample_input_fn=get_sample_inputs,
+        input_names=input_names,
+        output_names=output_names,
+        dynamic_axes=dynamic_axes,
+    )
+
+
+def prepare_vae_encoder_for_tensorrt(
+    vae: nn.Module,
+    device: str = 'cuda',
+    sample_image_shape: Tuple[int, int, int, int, int] = (1, 3, 1, 720, 1280)  # B, C, F, H, W
+) -> Optional[Path]:
+    """Prepare VAE encoder for TensorRT by ensuring ONNX model exists."""
+
+    def get_sample_inputs():
+        # VAE encoder expects images with shape [batch, channels, frames, height, width]
+        sample = torch.randn(*sample_image_shape, dtype=torch.float16, device=device)
+        return (sample,)
+
+    # Create a wrapper that returns mean and logvar
+    class VAEEncoderWrapper(nn.Module):
+        def __init__(self, vae_model, target_device):
+            super().__init__()
+            self.vae = vae_model
+            self.scale = float(getattr(vae_model.config, "scaling_factor", 1.0))
+            self.target_device = torch.device(target_device)
+
+        def forward(self, sample: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+            # Ensure input is on correct device
+            sample = sample.to(self.target_device)
+            posterior = self.vae.encode(sample)
+            latent_dist = posterior.latent_dist
+            return latent_dist.mean, latent_dist.logvar
+
+    wrapper = VAEEncoderWrapper(vae, device)
+    wrapper.eval()
+
+    input_names = ['sample']
+    output_names = ['mean', 'logvar']
+    dynamic_axes = {
+        'sample': {0: 'batch', 2: 'frames', 3: 'height', 4: 'width'},
+        'mean': {0: 'batch', 2: 'latent_frames', 3: 'latent_height', 4: 'latent_width'},
+        'logvar': {0: 'batch', 2: 'latent_frames', 3: 'latent_height', 4: 'latent_width'},
+    }
+
+    return ensure_model_is_onnx_compatible(
+        model=wrapper,
+        model_name='vae_encoder',
         sample_input_fn=get_sample_inputs,
         input_names=input_names,
         output_names=output_names,

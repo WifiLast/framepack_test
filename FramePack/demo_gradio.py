@@ -1463,10 +1463,14 @@ if ENABLE_TENSORRT_RUNTIME:
         if TENSORRT_RUNTIME.failure_reason:
             print(f"DEBUG: TENSORRT_RUNTIME.failure_reason = {TENSORRT_RUNTIME.failure_reason}")
         if TENSORRT_RUNTIME.is_ready:
-            TENSORRT_DECODER = TensorRTLatentDecoder(vae, TENSORRT_RUNTIME, fallback_fn=vae_decode)
-            TENSORRT_ENCODER = TensorRTLatentEncoder(vae, TENSORRT_RUNTIME, fallback_fn=vae_encode)
-            TENSORRT_AVAILABLE = True
-            print(f"TensorRT VAE acceleration enabled (workspace={TRT_WORKSPACE_MB} MB).")
+            # Note: Disabling torch-tensorrt runtime for VAE due to compatibility issues
+            # ONNX models will be created and can be converted to TensorRT engines using
+            # the optimize_onnx_with_tensorrt.py script or build_tensorrt_engines.py
+            print("Note: torch-tensorrt runtime for VAE has compatibility issues.")
+            print("ONNX models will be created for manual TensorRT conversion.")
+            TENSORRT_DECODER = None  # Disabled - use ONNX -> TensorRT workflow instead
+            TENSORRT_ENCODER = None  # Disabled - use ONNX -> TensorRT workflow instead
+            TENSORRT_AVAILABLE = True  # Still mark as available for other components
         else:
             TENSORRT_DECODER = None
             TENSORRT_ENCODER = None
@@ -1510,6 +1514,8 @@ if TENSORRT_AVAILABLE and TENSORRT_RUNTIME is not None:
                 prepare_clip_text_encoder_for_tensorrt,
                 prepare_transformer_for_tensorrt,
                 prepare_image_encoder_for_tensorrt,
+                prepare_vae_encoder_for_tensorrt,
+                prepare_vae_decoder_for_tensorrt,
             )
 
             print("\n" + "="*80)
@@ -1562,8 +1568,25 @@ if TENSORRT_AVAILABLE and TENSORRT_RUNTIME is not None:
                 else:
                     print(f"Image encoder ready for TensorRT: {image_encoder_onnx_path}")
 
+                # Skip VAE encoder/decoder for now due to device placement issues
+                # The Hunyuan Video VAE creates CPU tensors dynamically during forward pass
+                # which causes ONNX export to fail. This would require modifications to the
+                # diffusers library to fix properly.
+                print("\nSkipping VAE encoder/decoder ONNX conversion...")
+                print("Note: VAE has internal device placement issues that prevent ONNX export.")
+                print("The VAE will continue to use PyTorch (no TensorRT acceleration).")
+
             print("="*80)
-            print("ONNX preparation complete. TensorRT will compile engines on first use.")
+            print("ONNX Model Preparation Complete!")
+            print("="*80)
+            print("\nNext steps to use TensorRT acceleration:")
+            print("1. Build TensorRT engines from ONNX models:")
+            print("   python FramePack/build_tensorrt_engines.py --all")
+            print("\n   Or build specific models:")
+            print("   python FramePack/build_tensorrt_engines.py --model siglip_image_encoder")
+            print("\n2. TensorRT engines will be saved to: Cache/tensorrt_engines/")
+            print("\nNote: The torch-tensorrt runtime has compatibility issues with these models.")
+            print("Use the native TensorRT workflow (ONNX -> TensorRT engine) for best results.")
             print("="*80 + "\n")
 
         except Exception as exc:
