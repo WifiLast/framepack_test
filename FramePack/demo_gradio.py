@@ -967,6 +967,12 @@ parser.add_argument(
     default=os.environ.get("FRAMEPACK_TRT_TRANSFORMER", "0") == "1",
     help="Enable TensorRT acceleration for transformer model (experimental, requires --enable-tensorrt).",
 )
+parser.add_argument(
+    "--tensorrt-text-encoders",
+    action="store_true",
+    default=os.environ.get("FRAMEPACK_TRT_TEXT_ENCODERS", "0") == "1",
+    help="Enable TensorRT acceleration for LLAMA and CLIP text encoders (experimental, requires --enable-tensorrt).",
+)
 args = parser.parse_args()
 
 # for win desktop probably use --server 127.0.0.1 --inbrowser
@@ -991,8 +997,12 @@ VAE_UPSCALE_FACTOR = max(1, int(os.environ.get("FRAMEPACK_VAE_UPSCALE_FACTOR", "
 TRT_WORKSPACE_MB = int(os.environ.get("FRAMEPACK_TRT_WORKSPACE_MB", "4096"))
 TRT_MAX_AUX_STREAMS = int(os.environ.get("FRAMEPACK_TRT_MAX_AUX_STREAMS", "2"))
 TRT_TRANSFORMER_ENABLED = args.tensorrt_transformer
+TRT_TEXT_ENCODERS_ENABLED = args.tensorrt_text_encoders
 TRT_MAX_CACHED_SHAPES = int(os.environ.get("FRAMEPACK_TRT_MAX_CACHED_SHAPES", "8"))
 ENABLE_TENSORRT_RUNTIME = args.enable_tensorrt
+if TRT_TEXT_ENCODERS_ENABLED and not ENABLE_TENSORRT_RUNTIME:
+    print("TensorRT text encoders requested but TensorRT runtime disabled; ignoring flag.")
+    TRT_TEXT_ENCODERS_ENABLED = False
 
 memory_backend = memory_v2 if args.use_memory_v2 else memory_v1
 memory_optim = None
@@ -1462,19 +1472,24 @@ if TENSORRT_AVAILABLE and TENSORRT_RUNTIME is not None:
     )
     setattr(image_encoder, "_framepack_trt_callable", TENSORRT_SIGLIP_ENCODER)
 
-    # Initialize TensorRT text encoders (DISABLED - causing slowdown)
-    # TODO: Investigate why TensorRT text encoders are slower than PyTorch
-    # print("Initializing TensorRT text encoders...")
-    # TENSORRT_LLAMA_TEXT_ENCODER = TensorRTTextEncoder(
-    #     text_encoder,
-    #     TENSORRT_RUNTIME,
-    # )
-    # TENSORRT_CLIP_TEXT_ENCODER = TensorRTCLIPTextEncoder(
-    #     text_encoder_2,
-    #     TENSORRT_RUNTIME,
-    # )
-    # print("TensorRT text encoders initialized.")
-    print("TensorRT text encoders disabled (using PyTorch for text encoding)")
+    if TRT_TEXT_ENCODERS_ENABLED:
+        try:
+            print("Initializing TensorRT text encoders...")
+            TENSORRT_LLAMA_TEXT_ENCODER = TensorRTTextEncoder(
+                text_encoder,
+                TENSORRT_RUNTIME,
+            )
+            TENSORRT_CLIP_TEXT_ENCODER = TensorRTCLIPTextEncoder(
+                text_encoder_2,
+                TENSORRT_RUNTIME,
+            )
+            print("TensorRT text encoders initialized.")
+        except Exception as exc:
+            TENSORRT_LLAMA_TEXT_ENCODER = None
+            TENSORRT_CLIP_TEXT_ENCODER = None
+            print(f"Failed to initialize TensorRT text encoders: {exc}")
+    else:
+        print("TensorRT text encoders disabled (using PyTorch for text encoding)")
 
     # Initialize TensorRT transformer wrapper if enabled
     if TRT_TRANSFORMER_ENABLED:
