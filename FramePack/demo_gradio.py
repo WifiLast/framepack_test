@@ -1126,6 +1126,7 @@ if PARALLEL_LOADERS > 1 and not high_vram and not FORCE_PARALLEL_LOADERS:
     PARALLEL_LOADERS = 1
 QUANT_BITS = int(os.environ.get("FRAMEPACK_QUANT_BITS", "8"))
 USE_BITSANDBYTES = os.environ.get("FRAMEPACK_USE_BNB", "0") == "1"
+BNB_CPU_OFFLOAD = os.environ.get("FRAMEPACK_BNB_CPU_OFFLOAD", "1") == "1"
 USE_FSDP = os.environ.get("FRAMEPACK_USE_FSDP", "0") == "1"
 _enable_quant_env = os.environ.get("FRAMEPACK_ENABLE_QUANT")
 if _enable_quant_env is None:
@@ -1317,7 +1318,7 @@ if USE_BITSANDBYTES:
     bnb_config = BitsAndBytesConfig(
         load_in_8bit=not load_in_4bit,
         load_in_4bit=load_in_4bit,
-        llm_int8_enable_fp32_cpu_offload=os.environ.get("FRAMEPACK_BNB_CPU_OFFLOAD", "1") == "1",
+        llm_int8_enable_fp32_cpu_offload=BNB_CPU_OFFLOAD,
         bnb_4bit_compute_dtype=MODEL_COMPUTE_DTYPE,
         bnb_4bit_use_double_quant=os.environ.get("FRAMEPACK_BNB_DOUBLE_QUANT", "1") == "1",
     )
