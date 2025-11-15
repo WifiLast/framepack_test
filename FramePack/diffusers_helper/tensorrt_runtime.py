@@ -38,6 +38,7 @@ class TensorRTRuntime:
         self.failure_reason: Optional[str] = None
         self._modules: Dict[str, torch.nn.Module] = {}
         self._lock = threading.Lock()
+        self._enabled = False  # Use private attribute for property
 
         # Setup cache directory
         if cache_dir is None:
@@ -49,20 +50,35 @@ class TensorRTRuntime:
 
         if not self.requested:
             self.failure_reason = "TensorRT runtime not requested."
-            self.enabled = False
+            self._enabled = False
         elif torch_tensorrt is None:
             detail = ""
             if _TORCH_TRT_IMPORT_ERROR is not None:
                 detail = f" (import error: {_TORCH_TRT_IMPORT_ERROR})"
             self.failure_reason = f"torch_tensorrt is not available{detail}."
-            self.enabled = False
+            self._enabled = False
         elif not torch.cuda.is_available():
             self.failure_reason = "CUDA device is required for TensorRT acceleration."
-            self.enabled = False
+            self._enabled = False
         else:
-            self.enabled = True
+            self._enabled = True
+
+    @property
+    def enabled(self) -> bool:
+        return self._enabled
+
+    @enabled.setter
+    def enabled(self, value: bool) -> None:
+        if self._enabled != value:
+            print(f"DEBUG TensorRTRuntime.enabled changed from {self._enabled} to {value}")
+            import traceback
+            traceback.print_stack()
+        self._enabled = value
 
     def disable(self, reason: str) -> None:
+        print(f"DEBUG TensorRTRuntime.disable() called! Reason: {reason}")
+        import traceback
+        traceback.print_stack()
         self.failure_reason = reason
         self.enabled = False
         self._modules.clear()
