@@ -987,7 +987,7 @@ FAST_START = args.fast_start or os.environ.get("FRAMEPACK_FAST_START", "0") == "
 PARALLEL_LOADERS = int(os.environ.get("FRAMEPACK_PARALLEL_LOADERS", "0"))
 if PARALLEL_LOADERS <= 1 and FAST_START:
     PARALLEL_LOADERS = 4
-PRELOAD_REPOS = os.environ.get("FRAMEPACK_PRELOAD_REPOS", "1") == "1"
+PRELOAD_REPOS = os.environ.get("FRAMEPACK_PRELOAD_REPOS", "0") == "1"
 FORCE_PARALLEL_LOADERS = os.environ.get("FRAMEPACK_FORCE_PARALLEL_LOADERS", "0") == "1"
 
 CACHE_MODE = args.cache_mode.lower()
@@ -2556,7 +2556,7 @@ with block:
                 )
                 tensorrt_transformer_checkbox = gr.Checkbox(
                     label="TensorRT Transformer Acceleration (experimental)",
-                    value=False,
+                    value=TENSORRT_TRANSFORMER is not None,
                     visible=TENSORRT_TRANSFORMER is not None,
                     info="Requires torch-tensorrt + CUDA. Compiles transformer on first use (takes ~5-10min), then provides significant speedup. Experimental feature.",
                 )
