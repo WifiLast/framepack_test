@@ -17,6 +17,7 @@ def rescale_noise_cfg(noise_cfg, noise_pred_text, guidance_rescale=1.0):
 
 
 def fm_wrapper(transformer, t_scale=1000.0):
+    print(f"DEBUG fm_wrapper: transformer type = {type(transformer).__name__}")
     def k_model(x, sigma, **extra_args):
         dtype = extra_args['dtype']
         cfg_scale = extra_args['cfg_scale']
@@ -34,6 +35,7 @@ def fm_wrapper(transformer, t_scale=1000.0):
         else:
             hidden_states = torch.cat([x, concat_latent.to(x)], dim=1)
 
+        print(f"DEBUG fm_wrapper k_model: About to call transformer, type = {type(transformer).__name__}")
         pred_positive = transformer(hidden_states=hidden_states, timestep=timestep, return_dict=False, **extra_args['positive'])[0].float()
 
         if cfg_scale == 1.0:

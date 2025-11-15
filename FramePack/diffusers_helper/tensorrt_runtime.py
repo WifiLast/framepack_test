@@ -455,6 +455,7 @@ class TensorRTTransformer:
         return_dict: bool = False,
     ):
         """Execute transformer with optional TensorRT acceleration."""
+        print(f"DEBUG TRT Transformer __call__: runtime.is_ready = {self.runtime.is_ready}")
         if not self.runtime.is_ready:
             if self.fallback_fn is not None:
                 return self.fallback_fn(
