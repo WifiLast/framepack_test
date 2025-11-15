@@ -9,7 +9,7 @@ import torch
 @dataclasses.dataclass
 class FirstBlockCacheConfig:
     enabled: bool = True
-    threshold: float = 0.12
+    threshold: float = 0.10
     verbose: bool = False
 
 

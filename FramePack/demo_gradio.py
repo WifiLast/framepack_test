@@ -1454,6 +1454,8 @@ if ENABLE_TENSORRT_RUNTIME:
             max_aux_streams=TRT_MAX_AUX_STREAMS,
             cache_dir=trt_cache_dir,
         )
+        print(f"DEBUG: TENSORRT_RUNTIME.is_ready = {TENSORRT_RUNTIME.is_ready}")
+        print(f"DEBUG: TENSORRT_RUNTIME.enabled = {TENSORRT_RUNTIME.enabled}")
         if TENSORRT_RUNTIME.is_ready:
             TENSORRT_DECODER = TensorRTLatentDecoder(vae, TENSORRT_RUNTIME, fallback_fn=vae_decode)
             TENSORRT_ENCODER = TensorRTLatentEncoder(vae, TENSORRT_RUNTIME, fallback_fn=vae_encode)
@@ -1542,6 +1544,9 @@ if TENSORRT_AVAILABLE and TENSORRT_RUNTIME is not None:
             )
             TENSORRT_TRANSFORMER._max_cached_shapes = TRT_MAX_CACHED_SHAPES
             print("TensorRT transformer wrapper initialized. Engines will compile on first use per shape.")
+            print(f"DEBUG: TENSORRT_TRANSFORMER.runtime.is_ready = {TENSORRT_TRANSFORMER.runtime.is_ready}")
+            print(f"DEBUG: TENSORRT_TRANSFORMER.runtime.enabled = {TENSORRT_TRANSFORMER.runtime.enabled}")
+            print(f"DEBUG: TENSORRT_TRANSFORMER.runtime.failure_reason = {TENSORRT_TRANSFORMER.runtime.failure_reason}")
             if not warnings:
                 print("NOTE: First compilation may take 5-15 minutes and requires ~16GB GPU VRAM.")
         except Exception as exc:
