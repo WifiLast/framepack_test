@@ -94,6 +94,10 @@ def export_model_to_onnx(
         # Set model to eval mode
         model.eval()
 
+        # Clear CUDA cache before export
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
         # Export to ONNX
         with torch.inference_mode():
             torch.onnx.export(
@@ -108,6 +112,10 @@ def export_model_to_onnx(
                 dynamic_axes=dynamic_axes,
                 verbose=False,
             )
+
+        # Clear cache after export
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         print(f"Successfully exported {model_name} to ONNX: {onnx_path}")
         return onnx_path
