@@ -27,6 +27,7 @@ python convert_to_onnx.py \
 - `t5_text`: T5 text encoder
 - `vae`: VAE (Variational Autoencoder)
 - `unet`: UNet diffusion model
+- `framepack_i2v`: FramePackI2V HunyuanVideo transformer (handles split model files automatically)
 
 ## Examples
 
@@ -135,6 +136,44 @@ python convert_to_onnx.py \
     --subfolder text_encoder_2 \
     --output-name hunyuan_clip_encoder.onnx
 ```
+
+### 6. FramePackI2V HunyuanVideo Transformer
+
+Convert the FramePackI2V model (automatically handles split model files):
+
+```bash
+python convert_to_onnx.py \
+    --model-path hf_download/hub/models--lllyasviel--FramePackI2V_HY/snapshots/<snapshot-hash> \
+    --model-type framepack_i2v \
+    --output-dir Cache/onnx_models/ \
+    --output-name framepack_i2v_hy.onnx \
+    --opset-version 14
+```
+
+**What it does:**
+- Loads the FramePackI2V HunyuanVideo transformer model
+- **Automatically handles the 3 split safetensors files** (no manual merging needed!)
+- Generates sample inputs matching the transformer's forward signature
+- Exports to ONNX with dynamic batch/frame/resolution dimensions
+- Saves to `Cache/onnx_models/framepack_i2v_hy.onnx`
+
+**Model Details:**
+- **Input model size**: ~24GB (split into 3 files: 9.3GB + 9.4GB + 5.4GB)
+- **Model type**: HunyuanVideoTransformer3DModelPacked
+- **Use case**: Image-to-video generation with FramePack
+- **Note**: The model uses bfloat16 precision
+
+**Expected inputs:**
+- `hidden_states`: Latent tensor [batch, 16, frames, height, width]
+- `timestep`: Diffusion timestep scalar
+- `encoder_hidden_states`: Text embeddings [batch, seq_len, 4096]
+- `encoder_attention_mask`: Text attention mask [batch, seq_len]
+- `pooled_projections`: Pooled text embeddings [batch, 4096]
+- `guidance`: Guidance scale scalar
+- `image_embeddings`: Image conditioning [batch, 1, 1152]
+
+**Expected output:**
+- Denoised latent tensor [batch, 16, frames, height, width]
 
 ## Advanced Options
 

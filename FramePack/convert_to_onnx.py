@@ -237,6 +237,49 @@ def load_text_encoder(model_path: str, encoder_type: str = 'clip') -> Tuple[nn.M
     return model, config_dict
 
 
+def load_framepack_i2v_model(model_path: str) -> Tuple[nn.Module, dict]:
+    """
+    Load FramePackI2V HunyuanVideo transformer model.
+    This model is split into 3 safetensors files that are automatically loaded by from_pretrained.
+
+    Args:
+        model_path: Path to the model directory
+
+    Returns:
+        Tuple of (model, config_dict)
+    """
+    # Import the custom model class
+    sys.path.insert(0, str(Path(__file__).parent))
+    from diffusers_helper.models.hunyuan_video_packed import HunyuanVideoTransformer3DModelPacked
+
+    print(f"Loading FramePackI2V HunyuanVideo model from: {model_path}")
+    print("  Note: This model is split into 3 safetensors files which will be loaded automatically")
+
+    try:
+        model = HunyuanVideoTransformer3DModelPacked.from_pretrained(
+            model_path,
+            torch_dtype=torch.bfloat16,
+        )
+        model.eval()
+
+        config_dict = {
+            'in_channels': model.config.in_channels if hasattr(model.config, 'in_channels') else 16,
+            'out_channels': model.config.out_channels if hasattr(model.config, 'out_channels') else 16,
+        }
+
+        print(f"  Model type: {type(model).__name__}")
+        print(f"  Config: {config_dict}")
+
+        return model, config_dict
+
+    except Exception as e:
+        print(f"Failed to load FramePackI2V model: {e}")
+        import traceback
+        traceback.print_exc()
+        raise RuntimeError(f"Could not load FramePackI2V model from {model_path}\n"
+                         f"Make sure the model files are present and the path is correct.")
+
+
 def get_sample_inputs_flux_redux(model: nn.Module, config: dict, device: str = 'cuda') -> Tuple[Any, ...]:
     """Generate sample inputs for Flux Redux model (SiglipVisionModel expects pixel values)."""
     batch_size = 1
@@ -307,6 +350,68 @@ def get_sample_inputs_vae_decoder(model: nn.Module, config: dict, device: str = 
     return (latents,)
 
 
+def get_sample_inputs_framepack_i2v(model: nn.Module, config: dict, device: str = 'cuda') -> Tuple[Any, ...]:
+    """Generate sample inputs for FramePackI2V HunyuanVideo transformer."""
+    batch_size = 1
+    in_channels = config.get('in_channels', 16)
+    num_frames = 1
+    height, width = 45, 80  # Latent space dimensions (720/16, 1280/16)
+
+    # Main latent input
+    hidden_states = torch.randn(
+        batch_size, in_channels, num_frames, height, width,
+        dtype=torch.bfloat16,
+        device=device
+    )
+
+    # Timestep
+    timestep = torch.tensor([500.0], dtype=torch.bfloat16, device=device)
+
+    # Text encoder hidden states
+    text_seq_length = 256
+    text_hidden_size = 4096
+    encoder_hidden_states = torch.randn(
+        batch_size, text_seq_length, text_hidden_size,
+        dtype=torch.bfloat16,
+        device=device
+    )
+
+    # Attention mask for text
+    encoder_attention_mask = torch.ones(
+        batch_size, text_seq_length,
+        dtype=torch.bool,
+        device=device
+    )
+
+    # Pooled text projections
+    pooled_projections = torch.randn(
+        batch_size, text_hidden_size,
+        dtype=torch.bfloat16,
+        device=device
+    )
+
+    # Guidance scale
+    guidance = torch.tensor([6.0], dtype=torch.bfloat16, device=device)
+
+    # Image embeddings (for I2V - image to video)
+    image_emb_size = 1152
+    image_embeddings = torch.randn(
+        batch_size, 1, image_emb_size,
+        dtype=torch.bfloat16,
+        device=device
+    )
+
+    return (
+        hidden_states,
+        timestep,
+        encoder_hidden_states,
+        encoder_attention_mask,
+        pooled_projections,
+        guidance,
+        image_embeddings,
+    )
+
+
 def convert_model_to_onnx(
     model_path: str,
     model_type: str,
@@ -344,6 +449,7 @@ def convert_model_to_onnx(
         't5_text': lambda p: load_text_encoder(p, 't5'),
         'vae': load_diffusers_model,
         'unet': load_diffusers_model,
+        'framepack_i2v': load_framepack_i2v_model,
     }
 
     sample_input_generators = {
@@ -355,6 +461,7 @@ def convert_model_to_onnx(
         'vae_decoder': get_sample_inputs_vae_decoder,
         'vae': get_sample_inputs_vae_encoder,
         'unet': get_sample_inputs_vae_encoder,
+        'framepack_i2v': get_sample_inputs_framepack_i2v,
     }
 
     input_names_map = {
@@ -366,6 +473,15 @@ def convert_model_to_onnx(
         'vae_decoder': ['latents'],
         'vae': ['sample'],
         'unet': ['sample', 'timestep', 'encoder_hidden_states'],
+        'framepack_i2v': [
+            'hidden_states',
+            'timestep',
+            'encoder_hidden_states',
+            'encoder_attention_mask',
+            'pooled_projections',
+            'guidance',
+            'image_embeddings',
+        ],
     }
 
     output_names_map = {
@@ -377,6 +493,7 @@ def convert_model_to_onnx(
         'vae_decoder': ['sample'],
         'vae': ['latent_dist'],
         'unet': ['sample'],
+        'framepack_i2v': ['output'],
     }
 
     # Load model
@@ -438,6 +555,15 @@ def convert_model_to_onnx(
             'pixel_values': {0: 'batch'},
             'last_hidden_state': {0: 'batch'},
             'pooler_output': {0: 'batch'},
+        }
+    elif model_type == 'framepack_i2v':
+        dynamic_axes = {
+            'hidden_states': {0: 'batch', 2: 'frames', 3: 'height', 4: 'width'},
+            'encoder_hidden_states': {0: 'batch', 1: 'text_sequence'},
+            'encoder_attention_mask': {0: 'batch', 1: 'text_sequence'},
+            'pooled_projections': {0: 'batch'},
+            'image_embeddings': {0: 'batch'},
+            'output': {0: 'batch', 2: 'frames', 3: 'height', 4: 'width'},
         }
 
     # Determine output path
@@ -521,6 +647,7 @@ Supported model types:
   - t5_text: T5 text encoder
   - vae: VAE (encoder or decoder)
   - unet: UNet model
+  - framepack_i2v: FramePackI2V HunyuanVideo transformer (handles split model files)
         """
     )
 
@@ -535,7 +662,7 @@ Supported model types:
         '--model-type',
         type=str,
         required=True,
-        choices=['flux_redux', 'clip_text', 'llama_text', 't5_text', 'vae', 'vae_encoder', 'vae_decoder', 'unet'],
+        choices=['flux_redux', 'clip_text', 'llama_text', 't5_text', 'vae', 'vae_encoder', 'vae_decoder', 'unet', 'framepack_i2v'],
         help='Type of model to convert'
     )
 

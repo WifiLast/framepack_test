@@ -5,7 +5,8 @@
       "Bash(test:*)",
       "Bash(python:*)",
       "Bash(chmod:*)",
-      "Bash(git checkout:*)"
+      "Bash(git checkout:*)",
+      "Bash(nul)"
     ],
     "deny": [],
     "ask": []
