@@ -1297,6 +1297,10 @@ print(f'High-VRAM Mode: {high_vram}')
 if PARALLEL_LOADERS > 1 and not high_vram and not FORCE_PARALLEL_LOADERS:
     print('Low VRAM detected -> disabling parallel model loading to save memory.')
     PARALLEL_LOADERS = 1
+if ENABLE_COMPILE and not high_vram:
+    if os.environ.get("TORCH_COMPILE_DISABLE_CUDAGRAPHS") not in {"1", "true", "TRUE"}:
+        os.environ["TORCH_COMPILE_DISABLE_CUDAGRAPHS"] = "1"
+    print('Low VRAM detected -> torch.compile will run with CUDA graphs disabled (compat mode).')
 QUANT_BITS = int(os.environ.get("FRAMEPACK_QUANT_BITS", "8"))
 USE_BITSANDBYTES = os.environ.get("FRAMEPACK_USE_BNB", "0") == "1"
 BNB_CPU_OFFLOAD = os.environ.get("FRAMEPACK_BNB_CPU_OFFLOAD", "1") == "1"
