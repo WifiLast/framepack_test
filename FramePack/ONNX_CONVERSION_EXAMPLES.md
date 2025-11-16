@@ -177,7 +177,7 @@ python convert_to_onnx.py \
 - `timestep`: Diffusion timestep scalar
 - `encoder_hidden_states`: Text embeddings [batch, seq_len, 4096]
 - `encoder_attention_mask`: Text attention mask [batch, seq_len]
-- `pooled_projections`: Pooled text embeddings [batch, 4096]
+- `pooled_projections`: Pooled text embeddings [batch, 768]
 - `guidance`: Guidance scale scalar
 
 **Expected output:**

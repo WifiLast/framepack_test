@@ -394,7 +394,7 @@ def get_sample_inputs_framepack_i2v(model: nn.Module, config: dict, device: str 
 
     # Text encoder hidden states
     text_seq_length = 128  # Reduced for ONNX export
-    text_hidden_size = 4096
+    text_hidden_size = 4096  # Text embeddings dimension
     encoder_hidden_states = torch.randn(
         batch_size, text_seq_length, text_hidden_size,
         dtype=torch.bfloat16,
@@ -408,9 +408,11 @@ def get_sample_inputs_framepack_i2v(model: nn.Module, config: dict, device: str 
         device=device
     )
 
-    # Pooled text projections
+    # Pooled text projections - THIS IS 768, NOT 4096!
+    # See: pooled_projection_dim in HunyuanVideoTransformer3DModelPacked.__init__
+    pooled_projection_dim = 768
     pooled_projections = torch.randn(
-        batch_size, text_hidden_size,
+        batch_size, pooled_projection_dim,
         dtype=torch.bfloat16,
         device=device
     )
