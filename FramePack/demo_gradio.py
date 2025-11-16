@@ -973,19 +973,19 @@ parser.add_argument(
     "--tensorrt-transformer",
     action="store_true",
     default=os.environ.get("FRAMEPACK_TRT_TRANSFORMER", "0") == "1",
-    help="Enable TensorRT acceleration for transformer model (experimental, requires --enable-tensorrt).",
+    help="DONT WORK! Enable TensorRT acceleration for transformer model (experimental, requires --enable-tensorrt).",
 )
 parser.add_argument(
     "--tensorrt-text-encoders",
     action="store_true",
     default=os.environ.get("FRAMEPACK_TRT_TEXT_ENCODERS", "0") == "1",
-    help="Enable TensorRT acceleration for LLAMA and CLIP text encoders (experimental, requires --enable-tensorrt).",
+    help="DONT WORK! Enable TensorRT acceleration for LLAMA and CLIP text encoders (experimental, requires --enable-tensorrt).",
 )
 parser.add_argument(
     "--use-onnx-engines",
     action="store_true",
     default=os.environ.get("FRAMEPACK_USE_ONNX_ENGINES", "0") == "1",
-    help="Use ONNX models for inference (TensorRT engines if available, otherwise ONNX Runtime).",
+    help="DONT WORK! Use ONNX models for inference (TensorRT engines if available, otherwise ONNX Runtime).",
 )
 args = parser.parse_args()
 
@@ -1270,7 +1270,7 @@ FBCACHE_THRESHOLD = float(os.environ.get("FRAMEPACK_FBCACHE_THRESHOLD", "0.035")
 FBCACHE_VERBOSE = os.environ.get("FRAMEPACK_FBCACHE_VERBOSE", "0") == "1"
 ENABLE_SIM_CACHE = (os.environ.get("FRAMEPACK_ENABLE_SIM_CACHE", "0") == "1") and not args.disable_sim_cache
 CURRENT_SIM_CACHE_ENABLED = ENABLE_SIM_CACHE
-SIM_CACHE_THRESHOLD = float(os.environ.get("FRAMEPACK_SIM_CACHE_THRESHOLD", "0.9"))
+SIM_CACHE_THRESHOLD = float(os.environ.get("FRAMEPACK_SIM_CACHE_THRESHOLD", "0.8"))
 SIM_CACHE_MAX_SKIP = int(os.environ.get("FRAMEPACK_SIM_CACHE_MAX_SKIP", "1"))
 SIM_CACHE_MAX_ENTRIES = int(os.environ.get("FRAMEPACK_SIM_CACHE_MAX_ENTRIES", "12"))
 SIM_CACHE_USE_FAISS = os.environ.get("FRAMEPACK_SIM_CACHE_USE_FAISS", "0") == "1"
@@ -2673,7 +2673,7 @@ def worker(
                 move_model_to_device_with_memory_preservation(transformer_to_move, target_device=gpu, preserved_memory_gb=gpu_memory_preservation)
 
             if use_teacache:
-                transformer_backbone.initialize_teacache(enable_teacache=True, num_steps=steps, rel_l1_thresh=0.1)
+                transformer_backbone.initialize_teacache(enable_teacache=True, num_steps=steps, rel_l1_thresh=0.5)
             else:
                 transformer_backbone.initialize_teacache(enable_teacache=False)
 
