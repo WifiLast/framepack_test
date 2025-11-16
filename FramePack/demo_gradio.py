@@ -975,6 +975,12 @@ parser.add_argument(
     default=os.environ.get("FRAMEPACK_TRT_TEXT_ENCODERS", "0") == "1",
     help="Enable TensorRT acceleration for LLAMA and CLIP text encoders (experimental, requires --enable-tensorrt).",
 )
+parser.add_argument(
+    "--use-onnx-engines",
+    action="store_true",
+    default=os.environ.get("FRAMEPACK_USE_ONNX_ENGINES", "0") == "1",
+    help="Use ONNX models for inference (TensorRT engines if available, otherwise ONNX Runtime).",
+)
 args = parser.parse_args()
 
 # for win desktop probably use --server 127.0.0.1 --inbrowser
@@ -1002,10 +1008,12 @@ TRT_TRANSFORMER_ENABLED = args.tensorrt_transformer
 TRT_TEXT_ENCODERS_ENABLED = args.tensorrt_text_encoders
 TRT_MAX_CACHED_SHAPES = int(os.environ.get("FRAMEPACK_TRT_MAX_CACHED_SHAPES", "8"))
 ENABLE_TENSORRT_RUNTIME = args.enable_tensorrt
+USE_ONNX_ENGINES = args.use_onnx_engines
 
 print(f"DEBUG: ENABLE_TENSORRT_RUNTIME = {ENABLE_TENSORRT_RUNTIME}")
 print(f"DEBUG: TRT_TRANSFORMER_ENABLED = {TRT_TRANSFORMER_ENABLED}")
 print(f"DEBUG: TRT_TEXT_ENCODERS_ENABLED = {TRT_TEXT_ENCODERS_ENABLED}")
+print(f"DEBUG: USE_ONNX_ENGINES = {USE_ONNX_ENGINES}")
 
 if TRT_TEXT_ENCODERS_ENABLED and not ENABLE_TENSORRT_RUNTIME:
     print("TensorRT text encoders requested but TensorRT runtime disabled; ignoring flag.")
@@ -1487,7 +1495,101 @@ TENSORRT_TRANSFORMER = None
 TENSORRT_LLAMA_TEXT_ENCODER = None
 TENSORRT_CLIP_TEXT_ENCODER = None
 TENSORRT_SIGLIP_ENCODER = None
-if TENSORRT_AVAILABLE and TENSORRT_RUNTIME is not None:
+TENSORRT_SIGLIP_ENGINE = None  # For pre-built TensorRT engines
+
+# Check for ONNX models if --use-onnx-engines is set
+if USE_ONNX_ENGINES or ENABLE_TENSORRT_RUNTIME:
+    try:
+        from diffusers_helper.trt_engine_loader import load_engine_if_available
+        print("Checking for pre-built TensorRT engine for image encoder...")
+        TENSORRT_SIGLIP_ENGINE = load_engine_if_available("siglip_image_encoder")
+        if TENSORRT_SIGLIP_ENGINE is not None:
+            print("Loaded pre-built TensorRT engine for image encoder")
+            # Create a wrapper to use the engine
+            class TRTImageEncoderWrapper:
+                def __init__(self, engine):
+                    self.engine = engine
+                    self.device = torch.device('cuda')
+                    self.dtype = torch.float16
+
+                def __call__(self, pixel_values):
+                    """Forward pass using TensorRT engine."""
+                    # Ensure input is on GPU and correct dtype
+                    if not pixel_values.is_cuda:
+                        pixel_values = pixel_values.to(self.device)
+                    if pixel_values.dtype != self.dtype:
+                        pixel_values = pixel_values.to(self.dtype)
+
+                    # Run TensorRT inference
+                    outputs = self.engine(pixel_values=pixel_values)
+
+                    # Create output object similar to HuggingFace model
+                    class TRTOutput:
+                        def __init__(self, last_hidden_state, pooler_output):
+                            self.last_hidden_state = last_hidden_state
+                            self.pooler_output = pooler_output
+
+                    return TRTOutput(
+                        last_hidden_state=outputs['last_hidden_state'],
+                        pooler_output=outputs['pooler_output']
+                    )
+
+            # Wrap the engine to make it compatible with existing code
+            setattr(image_encoder, "_framepack_trt_engine", TRTImageEncoderWrapper(TENSORRT_SIGLIP_ENGINE))
+            print("Image encoder will use pre-built TensorRT engine for inference")
+        else:
+            print("No pre-built TensorRT engine found for image encoder")
+            # Try ONNX Runtime if --use-onnx-engines is set
+            if USE_ONNX_ENGINES:
+                print("Attempting to load ONNX model with ONNX Runtime...")
+                try:
+                    from diffusers_helper.onnx_runtime_loader import load_onnx_model_if_available
+                    onnx_model = load_onnx_model_if_available("siglip_image_encoder", use_gpu=True)
+                    if onnx_model is not None:
+                        print("Loaded ONNX model with ONNX Runtime for image encoder")
+                        # Create a wrapper to use the ONNX model
+                        class ONNXImageEncoderWrapper:
+                            def __init__(self, onnx_model):
+                                self.onnx_model = onnx_model
+                                self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+                                self.dtype = torch.float16
+
+                            def __call__(self, pixel_values):
+                                """Forward pass using ONNX Runtime."""
+                                # Ensure input is correct dtype
+                                if pixel_values.dtype != self.dtype:
+                                    pixel_values = pixel_values.to(self.dtype)
+
+                                # Run ONNX inference
+                                outputs = self.onnx_model(pixel_values=pixel_values)
+
+                                # Create output object similar to HuggingFace model
+                                class ONNXOutput:
+                                    def __init__(self, last_hidden_state, pooler_output):
+                                        self.last_hidden_state = last_hidden_state
+                                        self.pooler_output = pooler_output
+
+                                return ONNXOutput(
+                                    last_hidden_state=outputs['last_hidden_state'],
+                                    pooler_output=outputs['pooler_output']
+                                )
+
+                        # Wrap the ONNX model to make it compatible with existing code
+                        setattr(image_encoder, "_framepack_trt_engine", ONNXImageEncoderWrapper(onnx_model))
+                        print("Image encoder will use ONNX Runtime for inference")
+                    else:
+                        print("No ONNX model found for image encoder. Falling back to PyTorch.")
+                except Exception as onnx_exc:
+                    print(f"WARNING: Failed to load ONNX model: {onnx_exc}")
+                    print("Falling back to PyTorch.")
+    except Exception as exc:
+        print(f"WARNING: Failed to load TensorRT engine for image encoder: {exc}")
+        import traceback
+        traceback.print_exc()
+        TENSORRT_SIGLIP_ENGINE = None
+
+# Fallback to torch-tensorrt runtime if no pre-built engine
+if TENSORRT_SIGLIP_ENGINE is None and TENSORRT_AVAILABLE and TENSORRT_RUNTIME is not None:
     try:
         print("DEBUG: Creating TensorRT SiGLIP encoder wrapper...")
         def _siglip_forward(pixel_values):
@@ -1579,14 +1681,19 @@ if TENSORRT_AVAILABLE and TENSORRT_RUNTIME is not None:
             print("="*80)
             print("ONNX Model Preparation Complete!")
             print("="*80)
-            print("\nNext steps to use TensorRT acceleration:")
-            print("1. Build TensorRT engines from ONNX models:")
-            print("   python FramePack/build_tensorrt_engines.py --all")
-            print("\n   Or build specific models:")
-            print("   python FramePack/build_tensorrt_engines.py --model siglip_image_encoder")
-            print("\n2. TensorRT engines will be saved to: Cache/tensorrt_engines/")
-            print("\nNote: The torch-tensorrt runtime has compatibility issues with these models.")
-            print("Use the native TensorRT workflow (ONNX -> TensorRT engine) for best results.")
+            print("\nNext steps to use ONNX models:")
+            print("\nOption 1: Use ONNX Runtime (simpler, no additional setup)")
+            print("   python FramePack/demo_gradio.py --use-onnx-engines")
+            print("   Requires: pip install onnxruntime-gpu")
+            print("\nOption 2: Build TensorRT engines (faster, requires more setup)")
+            print("   1. Build engines:")
+            print("      python FramePack/build_tensorrt_engines.py --model siglip_image_encoder")
+            print("   2. Run with TensorRT:")
+            print("      python FramePack/demo_gradio.py --enable-tensorrt")
+            print("   Requires: pip install tensorrt pycuda")
+            print("\nONNX models location: Cache/onnx_models/")
+            print("TensorRT engines location: Cache/tensorrt_engines/")
+            print("\nNote: TensorRT provides better performance but ONNX Runtime is easier to setup.")
             print("="*80 + "\n")
 
         except Exception as exc:
