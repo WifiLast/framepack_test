@@ -29,6 +29,78 @@ from diffusers_helper.onnx_converter import (
     get_onnx_cache_dir,
 )
 
+DEFAULT_SD_V1_CONFIG = """model:
+  base_learning_rate: 1.0e-04
+  target: ldm.models.diffusion.ddpm.LatentDiffusion
+  params:
+    linear_start: 0.00085
+    linear_end: 0.0120
+    num_timesteps_cond: 1
+    log_every_t: 200
+    timesteps: 1000
+    first_stage_key: "jpg"
+    cond_stage_key: "txt"
+    image_size: 64
+    channels: 4
+    cond_stage_trainable: false   # Note: different from the one we trained before
+    conditioning_key: crossattn
+    monitor: val/loss_simple_ema
+    scale_factor: 0.18215
+    use_ema: False
+
+    scheduler_config: # 10000 warmup steps
+      target: ldm.lr_scheduler.LambdaLinearScheduler
+      params:
+        warm_up_steps: [ 10000 ]
+        cycle_lengths: [ 10000000000000 ] # incredibly large number to prevent corner cases
+        f_start: [ 1.e-6 ]
+        f_max: [ 1. ]
+        f_min: [ 1. ]
+
+    unet_config:
+      target: ldm.modules.diffusionmodules.openaimodel.UNetModel
+      params:
+        image_size: 32 # unused
+        in_channels: 4
+        out_channels: 4
+        model_channels: 320
+        attention_resolutions: [ 4, 2, 1 ]
+        num_res_blocks: 2
+        channel_mult: [ 1, 2, 4, 4 ]
+        num_heads: 8
+        use_spatial_transformer: True
+        transformer_depth: 1
+        context_dim: 768
+        use_checkpoint: True
+        legacy: False
+
+    first_stage_config:
+      target: ldm.models.autoencoder.AutoencoderKL
+      params:
+        embed_dim: 4
+        monitor: val/rec_loss
+        ddconfig:
+          double_z: true
+          z_channels: 4
+          resolution: 256
+          in_channels: 3
+          out_ch: 3
+          ch: 128
+          ch_mult:
+          - 1
+          - 2
+          - 4
+          - 4
+          num_res_blocks: 2
+          attn_resolutions: []
+          dropout: 0.0
+        lossconfig:
+          target: torch.nn.Identity
+
+    cond_stage_config:
+      target: ldm.modules.encoders.modules.FrozenCLIPEmbedder
+"""
+
 
 def load_flux_redux_model(model_path: str) -> Tuple[nn.Module, dict]:
     """
@@ -186,6 +258,92 @@ def load_diffusers_model(model_path: str, subfolder: Optional[str] = None) -> Tu
         pass
 
     raise RuntimeError(f"Could not load diffusers model from {model_path}")
+
+
+def ensure_default_sd_config(checkpoint_path: str) -> Path:
+    """
+    Ensure a default v1 Stable Diffusion config YAML exists on disk.
+
+    Args:
+        checkpoint_path: Path to the checkpoint (used for naming)
+
+    Returns:
+        Path to the generated YAML file
+    """
+    cache_dir = get_onnx_cache_dir() / "auto_sd_configs"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    cfg_path = cache_dir / f"{Path(checkpoint_path).stem}_auto_v1-inference.yaml"
+    if not cfg_path.exists():
+        cfg_path.write_text(DEFAULT_SD_V1_CONFIG)
+        print(f"  Generated default Stable Diffusion v1 config at: {cfg_path}")
+    else:
+        print(f"  Using cached auto-generated config at: {cfg_path}")
+
+    return cfg_path
+
+
+def load_sd_checkpoint_component(
+    checkpoint_path: str,
+    component: str,
+    sd_config_path: Optional[str] = None,
+) -> Tuple[nn.Module, dict]:
+    """
+    Load a Stable Diffusion component directly from a single-file checkpoint.
+
+    Args:
+        checkpoint_path: Path to .safetensors/.ckpt file
+        component: Component name ('unet', 'vae', 'vae_encoder', 'vae_decoder', 'clip_text')
+        sd_config_path: Optional original config YAML (required for SD1.x checkpoints)
+
+    Returns:
+        Tuple of (model, config_dict)
+    """
+    from diffusers import StableDiffusionPipeline
+
+    print(f"Loading {component} from Stable Diffusion checkpoint: {checkpoint_path}")
+    if sd_config_path:
+        print(f"  Using original config: {sd_config_path}")
+
+    pipe_kwargs = {'torch_dtype': torch.float16}
+    if sd_config_path:
+        pipe_kwargs['original_config_file'] = sd_config_path
+
+    pipe = StableDiffusionPipeline.from_single_file(
+        checkpoint_path,
+        **pipe_kwargs,
+    )
+
+    component = component.lower()
+    if component in ['vae', 'vae_encoder', 'vae_decoder']:
+        model = pipe.vae
+        config_dict = {
+            'in_channels': model.config.in_channels,
+            'latent_channels': model.config.latent_channels,
+        }
+    elif component == 'unet':
+        model = pipe.unet
+        config_dict = {
+            'in_channels': model.config.in_channels,
+            'out_channels': model.config.out_channels,
+        }
+    elif component == 'clip_text':
+        if not hasattr(pipe, 'text_encoder') or pipe.text_encoder is None:
+            raise RuntimeError("Checkpoint does not contain a CLIP text encoder")
+        model = pipe.text_encoder
+        config_dict = {
+            'hidden_size': model.config.hidden_size,
+            'vocab_size': model.config.vocab_size,
+        }
+    else:
+        raise ValueError(f"Unsupported component '{component}' for checkpoint loading")
+
+    model.eval()
+
+    # Free unnecessary parts of the pipeline
+    del pipe
+
+    return model, config_dict
 
 
 def load_text_encoder(model_path: str, encoder_type: str = 'clip') -> Tuple[nn.Module, dict]:
@@ -355,6 +513,61 @@ def get_sample_inputs_vae_decoder(model: nn.Module, config: dict, device: str = 
     return (latents,)
 
 
+def get_sample_inputs_unet(model: nn.Module, config: dict, device: str = 'cuda') -> Tuple[Any, ...]:
+    """Generate sample inputs for UNet diffusion model."""
+    batch_size = 1
+    in_channels = getattr(model.config, 'in_channels', config.get('in_channels', 4))
+    spatial = getattr(model.config, 'sample_size', 64)
+    if isinstance(spatial, (list, tuple)):
+        height, width = spatial
+    else:
+        height = width = spatial
+
+    sample = torch.randn(
+        batch_size, in_channels, height, width,
+        dtype=torch.float16,
+        device=device,
+    )
+
+    timestep = torch.tensor([500.0], dtype=torch.float32, device=device)
+
+    seq_length = 77
+    cross_attention_dim = getattr(model.config, 'cross_attention_dim', config.get('cross_attention_dim', 768))
+    encoder_hidden_states = torch.randn(
+        batch_size, seq_length, cross_attention_dim,
+        dtype=torch.float16,
+        device=device,
+    )
+
+    return (sample, timestep, encoder_hidden_states)
+
+
+class VAEEncoderWrapper(nn.Module):
+    """Wrapper to expose only the encoder portion of AutoencoderKL."""
+
+    def __init__(self, vae: nn.Module):
+        super().__init__()
+        self.vae = vae
+
+    def forward(self, sample: torch.Tensor) -> torch.Tensor:
+        latent_dist = self.vae.encode(sample).latent_dist
+        return latent_dist.mean
+
+
+class VAEDecoderWrapper(nn.Module):
+    """Wrapper to expose only the decoder portion of AutoencoderKL."""
+
+    def __init__(self, vae: nn.Module):
+        super().__init__()
+        self.vae = vae
+        self.scaling_factor = getattr(vae, 'scaling_factor', getattr(vae.config, 'scaling_factor', 0.18215))
+
+    def forward(self, latents: torch.Tensor) -> torch.Tensor:
+        scaled_latents = latents / self.scaling_factor
+        decoded = self.vae.decode(scaled_latents, return_dict=False)[0]
+        return decoded
+
+
 def get_sample_inputs_framepack_i2v(model: nn.Module, config: dict, device: str = 'cuda') -> Tuple[Any, ...]:
     """
     Generate sample inputs for FramePackI2V HunyuanVideo transformer.
@@ -444,6 +657,54 @@ def get_sample_inputs_framepack_i2v(model: nn.Module, config: dict, device: str 
     )
 
 
+def detect_sd_model_version(model_path: str) -> str:
+    """
+    Detect Stable Diffusion model version from checkpoint.
+
+    Args:
+        model_path: Path to the .safetensors/.ckpt file
+
+    Returns:
+        Version string: 'sd1', 'sd2', 'sdxl', or 'unknown'
+    """
+    try:
+        from safetensors import safe_open
+
+        path_obj = Path(model_path)
+        if not path_obj.exists():
+            return 'unknown'
+
+        # Load state dict keys to detect architecture
+        if path_obj.suffix.lower() == '.safetensors':
+            with safe_open(model_path, framework="pt", device="cpu") as f:
+                keys = list(f.keys())
+        else:
+            # For .ckpt files
+            import torch
+            checkpoint = torch.load(model_path, map_location='cpu')
+            if 'state_dict' in checkpoint:
+                keys = list(checkpoint['state_dict'].keys())
+            else:
+                keys = list(checkpoint.keys())
+
+        # Detect based on key patterns
+        # SDXL has more blocks and different structure
+        if any('conditioner' in k for k in keys):
+            return 'sdxl'
+        elif any('model.diffusion_model.input_blocks.8' in k for k in keys):
+            # SD2.x has deeper UNet
+            return 'sd2'
+        elif any('model.diffusion_model.input_blocks.0.0.weight' in k for k in keys):
+            # SD1.x
+            return 'sd1'
+        else:
+            return 'unknown'
+
+    except Exception as e:
+        print(f"Warning: Could not detect model version: {e}")
+        return 'unknown'
+
+
 def convert_model_to_onnx(
     model_path: str,
     model_type: str,
@@ -452,6 +713,7 @@ def convert_model_to_onnx(
     device: str = 'cuda',
     opset_version: int = 17,
     subfolder: Optional[str] = None,
+    sd_config_path: Optional[str] = None,
 ) -> Optional[Path]:
     """
     Convert a model to ONNX format.
@@ -480,6 +742,8 @@ def convert_model_to_onnx(
         'llama_text': lambda p: load_text_encoder(p, 'llama'),
         't5_text': lambda p: load_text_encoder(p, 't5'),
         'vae': load_diffusers_model,
+        'vae_encoder': load_diffusers_model,
+        'vae_decoder': load_diffusers_model,
         'unet': load_diffusers_model,
         'framepack_i2v': load_framepack_i2v_model,
     }
@@ -492,7 +756,7 @@ def convert_model_to_onnx(
         'vae_encoder': get_sample_inputs_vae_encoder,
         'vae_decoder': get_sample_inputs_vae_decoder,
         'vae': get_sample_inputs_vae_encoder,
-        'unet': get_sample_inputs_vae_encoder,
+        'unet': get_sample_inputs_unet,
         'framepack_i2v': get_sample_inputs_framepack_i2v,
     }
 
@@ -534,8 +798,25 @@ def convert_model_to_onnx(
         print(f"Supported types: {', '.join(model_loaders.keys())}")
         return None
 
+    model_path_obj = Path(model_path)
+    checkpoint_exts = {'.safetensors', '.ckpt', '.bin'}
+    is_checkpoint_file = model_path_obj.is_file() and model_path_obj.suffix.lower() in checkpoint_exts
+    sd_checkpoint_components = {'unet', 'vae', 'vae_encoder', 'vae_decoder', 'clip_text'}
+
     try:
-        if subfolder and model_type in ['vae', 'unet']:
+        if is_checkpoint_file:
+            if model_type not in sd_checkpoint_components:
+                print(f"Error: Checkpoint loading is only supported for: {', '.join(sorted(sd_checkpoint_components))}")
+                return None
+            if sd_config_path is None:
+                print("INFO: --sd-config-path not provided. Auto-generating default v1 config...")
+                sd_config_path = str(ensure_default_sd_config(model_path))
+            model, config = load_sd_checkpoint_component(
+                checkpoint_path=model_path,
+                component=model_type,
+                sd_config_path=sd_config_path,
+            )
+        elif subfolder and model_type in ['vae', 'vae_encoder', 'vae_decoder', 'unet']:
             model, config = load_diffusers_model(model_path, subfolder)
         else:
             model, config = loader(model_path)
@@ -544,6 +825,12 @@ def convert_model_to_onnx(
         import traceback
         traceback.print_exc()
         return None
+
+    # Wrap specific VAE components
+    if model_type == 'vae_decoder':
+        model = VAEDecoderWrapper(model)
+    elif model_type == 'vae_encoder':
+        model = VAEEncoderWrapper(model)
 
     # Move model to device
     if device == 'cuda' and torch.cuda.is_available():
@@ -608,7 +895,9 @@ def convert_model_to_onnx(
         if not onnx_path.suffix:
             onnx_path = onnx_path.with_suffix('.onnx')
     else:
-        model_name = f"{model_type}_{Path(model_path).name}"
+        model_path_obj = Path(model_path)
+        model_base_name = model_path_obj.stem if model_path_obj.is_file() else model_path_obj.name
+        model_name = f"{model_type}_{model_base_name}"
         onnx_path = output_dir / f"{model_name}.onnx"
 
     # Export to ONNX
@@ -646,38 +935,151 @@ def convert_model_to_onnx(
     return result
 
 
+def convert_all_checkpoint_components(
+    model_path: str,
+    output_dir: Optional[str] = None,
+    device: str = 'cuda',
+    opset_version: int = 17,
+    sd_config_path: Optional[str] = None,
+) -> dict:
+    """
+    Convert all components from a Stable Diffusion checkpoint to ONNX.
+
+    Args:
+        model_path: Path to the .safetensors/.ckpt file
+        output_dir: Output directory for ONNX files
+        device: Device to use for conversion
+        opset_version: ONNX opset version
+        sd_config_path: Optional SD config path
+
+    Returns:
+        Dictionary mapping component names to their ONNX paths (or None if failed)
+    """
+    print(f"\n{'='*80}")
+    print(f"Auto-detecting model architecture and converting all components")
+    print(f"{'='*80}\n")
+
+    # Detect model version
+    version = detect_sd_model_version(model_path)
+    print(f"Detected model version: {version}")
+
+    if version == 'unknown':
+        print("Warning: Could not auto-detect model version. Assuming SD1.5...")
+        version = 'sd1'
+
+    # Components to export
+    components = ['unet', 'vae_decoder', 'vae_encoder', 'clip_text']
+
+    results = {}
+    for component in components:
+        print(f"\n{'-'*80}")
+        print(f"Converting component: {component}")
+        print(f"{'-'*80}\n")
+
+        try:
+            result = convert_model_to_onnx(
+                model_path=model_path,
+                model_type=component,
+                output_dir=output_dir,
+                output_name=f"{component}_{Path(model_path).stem}.onnx",
+                device=device,
+                opset_version=opset_version,
+                sd_config_path=sd_config_path,
+            )
+            results[component] = result
+
+            if result:
+                print(f"SUCCESS: {component} exported to {result}")
+            else:
+                print(f"FAILED: {component} export failed")
+
+        except Exception as e:
+            print(f"ERROR exporting {component}: {e}")
+            import traceback
+            traceback.print_exc()
+            results[component] = None
+
+    # Summary
+    print(f"\n{'='*80}")
+    print(f"CONVERSION SUMMARY")
+    print(f"{'='*80}\n")
+
+    successful = [k for k, v in results.items() if v is not None]
+    failed = [k for k, v in results.items() if v is None]
+
+    if successful:
+        print(f"Successfully converted ({len(successful)}/{len(components)}):")
+        for comp in successful:
+            print(f"  ✓ {comp}: {results[comp]}")
+
+    if failed:
+        print(f"\nFailed to convert ({len(failed)}/{len(components)}):")
+        for comp in failed:
+            print(f"  ✗ {comp}")
+
+    print(f"\n{'='*80}\n")
+
+    return results
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Convert PyTorch models to ONNX format",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
+  # AUTO-DETECT: Convert all components from a Stable Diffusion checkpoint (RECOMMENDED)
+  python convert_to_onnx.py \\
+      --model-path indigoFurryMix_v100Anime.safetensors \\
+      --output-dir Cache/test/ \\
+      --opset-version 14
+
+  # This will auto-detect the model version and export: UNet, VAE decoder, VAE encoder, and CLIP text encoder
+
+  # Convert only specific component from checkpoint
+  python convert_to_onnx.py \\
+      --model-path indigoFurryMix_v100Anime.safetensors \\
+      --model-type vae_decoder \\
+      --output-dir Cache/test/ \\
+      --output-name vae_decoder.onnx \\
+      --opset-version 14
+
   # Convert Flux Redux model
   python convert_to_onnx.py \\
       --model-path hf_download/hub/models--lllyasviel--flux_redux_bfl/ \\
       --model-type flux_redux \\
       --output-dir Cache/onnx_models/
 
-  # Convert CLIP text encoder
+  # Convert Stable Diffusion 1.5 from diffusers format (UNet)
   python convert_to_onnx.py \\
-      --model-path hf_download/hub/models--openai--clip-vit-large-patch14/ \\
-      --model-type clip_text \\
-      --output-name clip_text_encoder.onnx
+      --model-path hf_download/hub/models--runwayml--stable-diffusion-v1-5/ \\
+      --model-type unet \\
+      --subfolder unet \\
+      --output-dir Cache/onnx_sd15
 
-  # Convert VAE from diffusers model
+  # Convert with custom SD config
   python convert_to_onnx.py \\
-      --model-path hf_download/hub/models--stabilityai--stable-diffusion-xl-base-1.0/ \\
-      --model-type vae \\
-      --subfolder vae
+      --model-path checkpoints/v1-5-pruned-emaonly.safetensors \\
+      --model-type all \\
+      --sd-config-path configs/stable-diffusion/v1-inference.yaml \\
+      --output-dir Cache/onnx_sd15
+
+Note:
+  - When --model-type is omitted for .safetensors/.ckpt files, it defaults to "all" (exports all components)
+  - When --sd-config-path is omitted for checkpoint files, a default SD v1 config is auto-generated
+  - Auto-generated configs are cached under Cache/onnx_models/auto_sd_configs/
 
 Supported model types:
-  - flux_redux: Flux Redux image encoder
+  - all: Export all components (UNet, VAE encoder, VAE decoder, CLIP text) - auto-detected for checkpoints
+  - unet: UNet diffusion model
+  - vae_decoder: VAE decoder (latents -> images)
+  - vae_encoder: VAE encoder (images -> latents)
   - clip_text: CLIP text encoder
+  - vae: VAE (encoder or decoder, auto-detected)
+  - flux_redux: Flux Redux image encoder
   - llama_text: LLaMA text encoder
   - t5_text: T5 text encoder
-  - vae: VAE (encoder or decoder)
-  - unet: UNet model
-  - framepack_i2v: FramePackI2V HunyuanVideo transformer (handles split model files)
+  - framepack_i2v: FramePackI2V HunyuanVideo transformer
         """
     )
 
@@ -691,9 +1093,10 @@ Supported model types:
     parser.add_argument(
         '--model-type',
         type=str,
-        required=True,
-        choices=['flux_redux', 'clip_text', 'llama_text', 't5_text', 'vae', 'vae_encoder', 'vae_decoder', 'unet', 'framepack_i2v'],
-        help='Type of model to convert'
+        required=False,
+        default=None,
+        choices=['flux_redux', 'clip_text', 'llama_text', 't5_text', 'vae', 'vae_encoder', 'vae_decoder', 'unet', 'framepack_i2v', 'all'],
+        help='Type of model to convert. Use "all" to export all components from a checkpoint (auto-detected if not specified for .safetensors/.ckpt files)'
     )
 
     parser.add_argument(
@@ -732,9 +1135,72 @@ Supported model types:
         help='ONNX opset version (default: 17)'
     )
 
+    parser.add_argument(
+        '--sd-config-path',
+        type=str,
+        default=None,
+        help='Original Stable Diffusion config .yaml (auto-generated v1 config if omitted for checkpoint files)'
+    )
+
     args = parser.parse_args()
 
-    # Convert model
+    # Auto-detect model type if not specified
+    model_path_obj = Path(args.model_path)
+    is_checkpoint = model_path_obj.is_file() and model_path_obj.suffix.lower() in ['.safetensors', '.ckpt']
+
+    if args.model_type is None:
+        if is_checkpoint:
+            print(f"Auto-detecting model type from checkpoint: {args.model_path}")
+            args.model_type = 'all'
+        else:
+            print("Error: --model-type is required for non-checkpoint files")
+            print("Supported types: flux_redux, clip_text, llama_text, t5_text, vae, vae_encoder, vae_decoder, unet, framepack_i2v, all")
+            sys.exit(1)
+
+    # Handle "all" option - convert all components from checkpoint
+    if args.model_type == 'all':
+        if not is_checkpoint:
+            print("Error: --model-type=all is only supported for .safetensors/.ckpt checkpoint files")
+            sys.exit(1)
+
+        # Print important warning
+        print("\n" + "="*80)
+        print("⚠️  IMPORTANT: ONNX Conversion is ONE-WAY")
+        print("="*80)
+        print("\nYou are about to convert your Stable Diffusion checkpoint to ONNX format.")
+        print("\nIMPORTANT NOTES:")
+        print("  ✓ ONNX files are for inference optimization (ONNX Runtime, TensorRT)")
+        print("  ✗ ONNX files CANNOT be converted back to working checkpoints")
+        print("  ✗ Weight names and structure will be different from the original")
+        print("  ✗ Resulting files will NOT work with SD WebUI or ComfyUI directly")
+        print("\nMAKE SURE TO:")
+        print("  • Keep your original .safetensors checkpoint file")
+        print("  • Only use ONNX files for optimized inference")
+        print("  • Do NOT delete the original checkpoint")
+        print("\n" + "="*80 + "\n")
+
+        response = input("Do you want to continue? (yes/no): ").strip().lower()
+        if response not in ['yes', 'y']:
+            print("Conversion cancelled.")
+            sys.exit(0)
+
+        results = convert_all_checkpoint_components(
+            model_path=args.model_path,
+            output_dir=args.output_dir,
+            device=args.device,
+            opset_version=args.opset_version,
+            sd_config_path=args.sd_config_path,
+        )
+
+        # Check if at least one component succeeded
+        if any(v is not None for v in results.values()):
+            print("Conversion completed with some successes!")
+            sys.exit(0)
+        else:
+            print("\nAll conversions failed!")
+            sys.exit(1)
+
+    # Convert single model
     result = convert_model_to_onnx(
         model_path=args.model_path,
         model_type=args.model_type,
@@ -743,6 +1209,7 @@ Supported model types:
         device=args.device,
         opset_version=args.opset_version,
         subfolder=args.subfolder,
+        sd_config_path=args.sd_config_path,
     )
 
     if result is None:
