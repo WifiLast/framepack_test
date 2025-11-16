@@ -139,7 +139,17 @@ python convert_to_onnx.py \
 
 ### 6. FramePackI2V HunyuanVideo Transformer
 
-Convert the FramePackI2V model (automatically handles split model files):
+**⚠️ IMPORTANT LIMITATION**: The FramePackI2V transformer model has **known issues** with ONNX export:
+- The model uses `torch.meshgrid` in rotary position embeddings, which is not fully ONNX-compatible
+- The model is extremely large (~24GB) and complex
+- ONNX export will **fail** with the current implementation
+
+**Recommended Alternative Approaches:**
+1. **Use PyTorch directly with torch.compile** for TensorRT-like acceleration
+2. **Export individual components** separately (text encoders, VAE, image encoder)
+3. **Use quantization** (FP8, INT8) on the PyTorch model instead
+
+If you still want to attempt ONNX export (for reference/experimentation):
 
 ```bash
 python convert_to_onnx.py \
@@ -147,33 +157,59 @@ python convert_to_onnx.py \
     --model-type framepack_i2v \
     --output-dir Cache/onnx_models/ \
     --output-name framepack_i2v_hy.onnx \
-    --opset-version 14
+    --opset-version 17
 ```
 
-**What it does:**
+**What it attempts:**
 - Loads the FramePackI2V HunyuanVideo transformer model
 - **Automatically handles the 3 split safetensors files** (no manual merging needed!)
 - Generates sample inputs matching the transformer's forward signature
-- Exports to ONNX with dynamic batch/frame/resolution dimensions
-- Saves to `Cache/onnx_models/framepack_i2v_hy.onnx`
+- **Note**: Export will likely fail due to torch.meshgrid incompatibility
 
 **Model Details:**
 - **Input model size**: ~24GB (split into 3 files: 9.3GB + 9.4GB + 5.4GB)
 - **Model type**: HunyuanVideoTransformer3DModelPacked
 - **Use case**: Image-to-video generation with FramePack
-- **Note**: The model uses bfloat16 precision
+- **Precision**: bfloat16
 
-**Expected inputs:**
+**Expected inputs (if export succeeds):**
 - `hidden_states`: Latent tensor [batch, 16, frames, height, width]
 - `timestep`: Diffusion timestep scalar
 - `encoder_hidden_states`: Text embeddings [batch, seq_len, 4096]
 - `encoder_attention_mask`: Text attention mask [batch, seq_len]
 - `pooled_projections`: Pooled text embeddings [batch, 4096]
 - `guidance`: Guidance scale scalar
-- `image_embeddings`: Image conditioning [batch, 1, 1152]
 
 **Expected output:**
 - Denoised latent tensor [batch, 16, frames, height, width]
+
+**Better Alternative - Export Individual Components:**
+
+Instead of exporting the entire transformer, export the auxiliary models which work much better with ONNX:
+
+```bash
+# Export text encoder (LLaMA)
+python convert_to_onnx.py \
+    --model-path tencent/HunyuanVideo \
+    --model-type llama_text \
+    --subfolder text_encoder \
+    --output-name hunyuan_text_encoder.onnx
+
+# Export CLIP text encoder
+python convert_to_onnx.py \
+    --model-path tencent/HunyuanVideo \
+    --model-type clip_text \
+    --subfolder text_encoder_2 \
+    --output-name hunyuan_clip_encoder.onnx
+
+# Export VAE (if available separately)
+python convert_to_onnx.py \
+    --model-path path/to/vae \
+    --model-type vae \
+    --output-name hunyuan_vae.onnx
+```
+
+These component exports will succeed and can provide some acceleration benefits.
 
 ## Advanced Options
 

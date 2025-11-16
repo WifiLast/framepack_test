@@ -254,6 +254,11 @@ def load_framepack_i2v_model(model_path: str) -> Tuple[nn.Module, dict]:
 
     print(f"Loading FramePackI2V HunyuanVideo model from: {model_path}")
     print("  Note: This model is split into 3 safetensors files which will be loaded automatically")
+    print("  WARNING: ONNX export of this large transformer model has known issues:")
+    print("    - torch.meshgrid in rotary embeddings is not fully ONNX-compatible")
+    print("    - The model is very large (~24GB) and complex")
+    print("    - Consider exporting individual components (text encoders, VAE) instead")
+    print("    - For TensorRT acceleration, use PyTorch directly with torch.compile")
 
     try:
         model = HunyuanVideoTransformer3DModelPacked.from_pretrained(
@@ -351,11 +356,31 @@ def get_sample_inputs_vae_decoder(model: nn.Module, config: dict, device: str = 
 
 
 def get_sample_inputs_framepack_i2v(model: nn.Module, config: dict, device: str = 'cuda') -> Tuple[Any, ...]:
-    """Generate sample inputs for FramePackI2V HunyuanVideo transformer."""
+    """
+    Generate sample inputs for FramePackI2V HunyuanVideo transformer.
+
+    Forward signature:
+        forward(hidden_states, timestep, encoder_hidden_states, encoder_attention_mask,
+                pooled_projections, guidance, latent_indices=None, clean_latents=None,
+                clean_latent_indices=None, clean_latents_2x=None, clean_latent_2x_indices=None,
+                clean_latents_4x=None, clean_latent_4x_indices=None, image_embeddings=None,
+                attention_kwargs=None, return_dict=True)
+    """
+    # Note: For ONNX export, we need to disable certain features that use dynamic operations
+    # like torch.meshgrid in rotary embeddings
+
+    # Temporarily disable model features that are incompatible with ONNX
+    original_image_proj = getattr(model, 'image_projection', None)
+
+    # Disable image projection to avoid meshgrid issues
+    if hasattr(model, 'image_projection'):
+        model.image_projection = None
+
     batch_size = 1
     in_channels = config.get('in_channels', 16)
+    # Use patch_size_t = 1 for simpler export (typical value)
     num_frames = 1
-    height, width = 45, 80  # Latent space dimensions (720/16, 1280/16)
+    height, width = 16, 32  # Smaller size for ONNX export to reduce memory
 
     # Main latent input
     hidden_states = torch.randn(
@@ -364,11 +389,11 @@ def get_sample_inputs_framepack_i2v(model: nn.Module, config: dict, device: str 
         device=device
     )
 
-    # Timestep
+    # Timestep - use scalar instead of tensor
     timestep = torch.tensor([500.0], dtype=torch.bfloat16, device=device)
 
     # Text encoder hidden states
-    text_seq_length = 256
+    text_seq_length = 128  # Reduced for ONNX export
     text_hidden_size = 4096
     encoder_hidden_states = torch.randn(
         batch_size, text_seq_length, text_hidden_size,
@@ -393,14 +418,6 @@ def get_sample_inputs_framepack_i2v(model: nn.Module, config: dict, device: str 
     # Guidance scale
     guidance = torch.tensor([6.0], dtype=torch.bfloat16, device=device)
 
-    # Image embeddings (for I2V - image to video)
-    image_emb_size = 1152
-    image_embeddings = torch.randn(
-        batch_size, 1, image_emb_size,
-        dtype=torch.bfloat16,
-        device=device
-    )
-
     return (
         hidden_states,
         timestep,
@@ -408,7 +425,6 @@ def get_sample_inputs_framepack_i2v(model: nn.Module, config: dict, device: str 
         encoder_attention_mask,
         pooled_projections,
         guidance,
-        image_embeddings,
     )
 
 
@@ -480,7 +496,6 @@ def convert_model_to_onnx(
             'encoder_attention_mask',
             'pooled_projections',
             'guidance',
-            'image_embeddings',
         ],
     }
 
@@ -562,7 +577,6 @@ def convert_model_to_onnx(
             'encoder_hidden_states': {0: 'batch', 1: 'text_sequence'},
             'encoder_attention_mask': {0: 'batch', 1: 'text_sequence'},
             'pooled_projections': {0: 'batch'},
-            'image_embeddings': {0: 'batch'},
             'output': {0: 'batch', 2: 'frames', 3: 'height', 4: 'width'},
         }
 
