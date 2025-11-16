@@ -2091,13 +2091,14 @@ else:
 print('DEBUG: Reached compilation check point')
 if torch.cuda.is_available() and not FAST_START and ENABLE_COMPILE:
     print('DEBUG: Starting module compilation...')
+    compile_mode = "max-autotune-no-cudagraphs"
     if not USE_BITSANDBYTES:
         print('DEBUG: Compiling text_encoder...')
-        text_encoder = maybe_compile_module(text_encoder, mode="reduce-overhead", dynamic=False)
+        text_encoder = maybe_compile_module(text_encoder, mode=compile_mode, dynamic=False)
         print('DEBUG: Compiling text_encoder_2...')
-        text_encoder_2 = maybe_compile_module(text_encoder_2, mode="reduce-overhead", dynamic=False)
+        text_encoder_2 = maybe_compile_module(text_encoder_2, mode=compile_mode, dynamic=False)
         print('DEBUG: Text encoders compiled')
-    image_encoder = maybe_compile_module(image_encoder, mode="reduce-overhead", dynamic=False)
+    image_encoder = maybe_compile_module(image_encoder, mode=compile_mode, dynamic=False)
 elif not ENABLE_COMPILE:
     print('FRAMEPACK_ENABLE_COMPILE=0 -> skipping torch.compile for encoders.')
 elif torch.cuda.is_available() and FAST_START:
@@ -2105,7 +2106,7 @@ elif torch.cuda.is_available() and FAST_START:
 
 if INFERENCE_CONFIG.torchscript.mode == "off":
     if ENABLE_COMPILE and not FAST_START:
-        transformer_core = maybe_compile_module(transformer_core, mode="reduce-overhead", dynamic=True)
+        transformer_core = maybe_compile_module(transformer_core, mode=compile_mode, dynamic=True)
     elif not ENABLE_COMPILE:
         print('FRAMEPACK_ENABLE_COMPILE=0 -> skipping torch.compile for transformer.')
     elif FAST_START:
