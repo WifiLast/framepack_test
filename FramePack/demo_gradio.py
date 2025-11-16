@@ -958,6 +958,12 @@ parser.add_argument("--xformers-mode", type=str, choices=["off", "standard", "ag
 parser.add_argument("--fast-start", action='store_true', help="Skip optional optimizations to reduce startup latency.")
 parser.add_argument("--use-memory-v2", action="store_true", help="Enable optimized memory_v2 backend (async streams, pinned memory, cached stats).")
 parser.add_argument(
+    "--enforce-low-precision",
+    action="store_true",
+    default=os.environ.get("FRAMEPACK_ENFORCE_LOW_PRECISION", "0") == "1",
+    help="Force modules to run in low precision (fp16/bf16) where possible. Disabled by default.",
+)
+parser.add_argument(
     "--enable-tensorrt",
     action="store_true",
     default=os.environ.get("FRAMEPACK_ENABLE_TENSORRT", "0") == "1",
@@ -1009,10 +1015,22 @@ TRT_TEXT_ENCODERS_ENABLED = args.tensorrt_text_encoders
 TRT_MAX_CACHED_SHAPES = int(os.environ.get("FRAMEPACK_TRT_MAX_CACHED_SHAPES", "8"))
 ENABLE_TENSORRT_RUNTIME = args.enable_tensorrt
 USE_ONNX_ENGINES = args.use_onnx_engines
+ENFORCE_LOW_PRECISION = args.enforce_low_precision
 
 print(f"DEBUG: ENABLE_TENSORRT_RUNTIME = {ENABLE_TENSORRT_RUNTIME}")
 print(f"DEBUG: TRT_TRANSFORMER_ENABLED = {TRT_TRANSFORMER_ENABLED}")
 print(f"DEBUG: TRT_TEXT_ENCODERS_ENABLED = {TRT_TEXT_ENCODERS_ENABLED}")
+
+_onnx_trt_env = os.environ.get("FRAMEPACK_ONNX_TRT_ENABLE")
+if _onnx_trt_env is None:
+    ONNX_TRT_PROVIDER_ENABLED = ENABLE_TENSORRT_RUNTIME or USE_ONNX_ENGINES
+else:
+    ONNX_TRT_PROVIDER_ENABLED = _onnx_trt_env == "1"
+ONNX_TRT_FP16 = os.environ.get("FRAMEPACK_ONNX_TRT_FP16", "1") == "1"
+ONNX_TRT_INT8 = os.environ.get("FRAMEPACK_ONNX_TRT_INT8", "0") == "1"
+ONNX_TRT_DEVICE_ID = int(os.environ.get("FRAMEPACK_ONNX_TRT_DEVICE_ID", "0"))
+ONNX_TRT_WORKSPACE_MB = int(os.environ.get("FRAMEPACK_ONNX_TRT_WORKSPACE_MB", str(TRT_WORKSPACE_MB)))
+ONNX_TRT_CACHE_DIR = os.environ.get("FRAMEPACK_ONNX_TRT_CACHE_DIR") or os.environ.get("FRAMEPACK_TENSORRT_CACHE_DIR")
 print(f"DEBUG: USE_ONNX_ENGINES = {USE_ONNX_ENGINES}")
 
 if TRT_TEXT_ENCODERS_ENABLED and not ENABLE_TENSORRT_RUNTIME:
@@ -1544,7 +1562,16 @@ if USE_ONNX_ENGINES or ENABLE_TENSORRT_RUNTIME:
                 print("Attempting to load ONNX model with ONNX Runtime...")
                 try:
                     from diffusers_helper.onnx_runtime_loader import load_onnx_model_if_available
-                    onnx_model = load_onnx_model_if_available("siglip_image_encoder", use_gpu=True)
+                    onnx_model = load_onnx_model_if_available(
+                        "siglip_image_encoder",
+                        use_gpu=True,
+                        enable_tensorrt=ONNX_TRT_PROVIDER_ENABLED,
+                        trt_device_id=ONNX_TRT_DEVICE_ID,
+                        trt_workspace_size_mb=ONNX_TRT_WORKSPACE_MB,
+                        trt_fp16=ONNX_TRT_FP16,
+                        trt_int8=ONNX_TRT_INT8,
+                        trt_cache_dir=ONNX_TRT_CACHE_DIR,
+                    )
                     if onnx_model is not None:
                         print("Loaded ONNX model with ONNX Runtime for image encoder")
                         # Create a wrapper to use the ONNX model
@@ -1885,34 +1912,40 @@ if ENABLE_QUANT:
 
     for module in manual_quant_targets:
         apply_int_nbit_quantization(module, num_bits=QUANT_BITS, target_dtype=MODEL_COMPUTE_DTYPE)
-        enforce_low_precision(module, activation_dtype=MODEL_COMPUTE_DTYPE)
+        if ENFORCE_LOW_PRECISION:
+            enforce_low_precision(module, activation_dtype=MODEL_COMPUTE_DTYPE)
+    if not ENFORCE_LOW_PRECISION:
+        print("Low precision enforcement disabled; quantized modules will keep their existing dtype.")
 else:
     if _enable_quant_env is None:
         print('FRAMEPACK_ENABLE_QUANT not set -> skipping module quantization.')
     else:
         print('FRAMEPACK_ENABLE_QUANT=0 -> skipping module quantization.')
-    print('DEBUG: About to enforce low precision on modules...')
-    enforce_targets = [vae, image_encoder]
-    if not FP8_TRANSFORMER_ACTIVE:
-        enforce_targets.append(transformer_core)
-    print(f'DEBUG: enforce_targets has {len(enforce_targets)} modules')
-    for i, module in enumerate(enforce_targets):
-        print(f'DEBUG: Enforcing low precision on module {i+1}/{len(enforce_targets)}...')
-        enforce_low_precision(module, activation_dtype=MODEL_COMPUTE_DTYPE)
-        print(f'DEBUG: Completed module {i+1}/{len(enforce_targets)}')
-        # Force memory cleanup after each module
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-    print('DEBUG: enforce_targets complete')
-    if not USE_BITSANDBYTES:
-        print('DEBUG: Processing text encoders (skipping problematic dtype conversion)...')
-        # NOTE: Text encoders are already loaded with torch_dtype=torch.float16 (line 1337)
-        # Calling .to(dtype=...) on these large models causes segfaults/crashes
-        # Skip the conversion since they're already in the correct dtype
-        print(f'DEBUG: text_encoder type: {type(text_encoder).__name__}')
-        print(f'DEBUG: text_encoder_2 type: {type(text_encoder_2).__name__}')
-        print('DEBUG: Text encoders already in correct dtype (float16), skipping conversion')
-        print('DEBUG: Text encoders complete')
+    if ENFORCE_LOW_PRECISION:
+        print('DEBUG: About to enforce low precision on modules...')
+        enforce_targets = [vae, image_encoder]
+        if not FP8_TRANSFORMER_ACTIVE:
+            enforce_targets.append(transformer_core)
+        print(f'DEBUG: enforce_targets has {len(enforce_targets)} modules')
+        for i, module in enumerate(enforce_targets):
+            print(f'DEBUG: Enforcing low precision on module {i+1}/{len(enforce_targets)}...')
+            enforce_low_precision(module, activation_dtype=MODEL_COMPUTE_DTYPE)
+            print(f'DEBUG: Completed module {i+1}/{len(enforce_targets)}')
+            # Force memory cleanup after each module
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        print('DEBUG: enforce_targets complete')
+        if not USE_BITSANDBYTES:
+            print('DEBUG: Processing text encoders (skipping problematic dtype conversion)...')
+            # NOTE: Text encoders are already loaded with torch_dtype=torch.float16 (line 1337)
+            # Calling .to(dtype=...) on these large models causes segfaults/crashes
+            # Skip the conversion since they're already in the correct dtype
+            print(f'DEBUG: text_encoder type: {type(text_encoder).__name__}')
+            print(f'DEBUG: text_encoder_2 type: {type(text_encoder_2).__name__}')
+            print('DEBUG: Text encoders already in correct dtype (float16), skipping conversion')
+            print('DEBUG: Text encoders complete')
+    else:
+        print('Low precision enforcement disabled; models retain their loaded precision.')
 
 print('DEBUG: Reached compilation check point')
 if torch.cuda.is_available() and not FAST_START and ENABLE_COMPILE:

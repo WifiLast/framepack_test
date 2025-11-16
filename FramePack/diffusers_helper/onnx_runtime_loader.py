@@ -20,16 +20,40 @@ except ImportError:
     ort = None
 
 
+def _default_trt_cache_dir() -> Path:
+    override = os.environ.get('FRAMEPACK_ONNX_TRT_CACHE_DIR') or os.environ.get('FRAMEPACK_TENSORRT_CACHE_DIR')
+    if override:
+        return Path(override)
+    return Path(os.path.join(os.path.dirname(__file__), '..', 'Cache', 'tensorrt_engines'))
+
+
 class ONNXRuntimeModel:
     """Wrapper for loading and running ONNX models with ONNX Runtime."""
 
-    def __init__(self, onnx_path: str, use_gpu: bool = True):
+    def __init__(
+        self,
+        onnx_path: str,
+        *,
+        use_gpu: bool = True,
+        enable_tensorrt: bool = False,
+        trt_device_id: int = 0,
+        trt_workspace_size_mb: int = 4096,
+        trt_fp16: bool = True,
+        trt_int8: bool = False,
+        trt_cache_dir: Optional[str] = None,
+    ):
         """
         Initialize ONNX Runtime model from file.
 
         Args:
             onnx_path: Path to the .onnx file
             use_gpu: Whether to use GPU (CUDA) execution provider
+            enable_tensorrt: Try to enable TensorRT execution provider (if available)
+            trt_device_id: GPU device index
+            trt_workspace_size_mb: TensorRT workspace size (MB)
+            trt_fp16: Enable FP16 kernels for TensorRT
+            trt_int8: Enable INT8 kernels for TensorRT
+            trt_cache_dir: Cache folder for TensorRT engine plans
         """
         if not ONNXRUNTIME_AVAILABLE:
             raise RuntimeError("ONNX Runtime is not available. Install onnxruntime or onnxruntime-gpu.")
@@ -38,13 +62,43 @@ class ONNXRuntimeModel:
         if not self.onnx_path.exists():
             raise FileNotFoundError(f"ONNX file not found: {onnx_path}")
 
-        # Set up execution providers
-        providers = []
-        if use_gpu and torch.cuda.is_available():
-            providers.append('CUDAExecutionProvider')
-        providers.append('CPUExecutionProvider')
+        try:
+            available_providers = ort.get_available_providers()
+        except Exception:
+            available_providers = []
 
-        # Create ONNX Runtime session
+        providers = []
+        using_gpu = False
+
+        if (
+            enable_tensorrt
+            and use_gpu
+            and torch.cuda.is_available()
+            and "TensorrtExecutionProvider" in available_providers
+        ):
+            cache_path = Path(trt_cache_dir) if trt_cache_dir else _default_trt_cache_dir()
+            cache_path.mkdir(parents=True, exist_ok=True)
+            trt_options = {
+                "device_id": int(trt_device_id),
+                "trt_max_workspace_size": int(max(256, trt_workspace_size_mb)) * 1024 * 1024,
+                "trt_fp16_enable": bool(trt_fp16),
+                "trt_int8_enable": bool(trt_int8),
+                "trt_engine_cache_enable": True,
+                "trt_engine_cache_path": str(cache_path),
+                "trt_timing_cache_enable": True,
+                "trt_force_sequential_engine_build": False,
+                "trt_max_partition_iterations": 1000,
+                "trt_min_subgraph_size": 1,
+            }
+            providers.append(("TensorrtExecutionProvider", trt_options))
+            using_gpu = True
+
+        if use_gpu and torch.cuda.is_available() and "CUDAExecutionProvider" in available_providers:
+            providers.append(("CUDAExecutionProvider", {"device_id": int(trt_device_id)}))
+            using_gpu = True
+
+        providers.append("CPUExecutionProvider")
+
         sess_options = ort.SessionOptions()
         sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
 
@@ -52,12 +106,30 @@ class ONNXRuntimeModel:
             self.session = ort.InferenceSession(
                 str(self.onnx_path),
                 sess_options=sess_options,
-                providers=providers
+                providers=providers,
             )
         except Exception as e:
-            raise RuntimeError(f"Failed to load ONNX model from {onnx_path}: {e}")
+            if providers and isinstance(providers[0], tuple) and providers[0][0] == "TensorrtExecutionProvider":
+                print(f"TensorRT Execution Provider failed to initialize ({e}); falling back to CUDA/CPU.")
+                fallback_providers = [p for p in providers if not (isinstance(p, tuple) and p[0] == "TensorrtExecutionProvider")]
+                self.session = ort.InferenceSession(
+                    str(self.onnx_path),
+                    sess_options=sess_options,
+                    providers=fallback_providers,
+                )
+                using_gpu = any(
+                    (isinstance(p, tuple) and p[0] == "CUDAExecutionProvider") or p == "CUDAExecutionProvider"
+                    for p in fallback_providers
+                )
+            else:
+                raise RuntimeError(f"Failed to load ONNX model from {onnx_path}: {e}")
 
-        # Get input/output information
+        self._using_gpu_provider = using_gpu
+        session_providers = self.session.get_providers()
+        self.provider = session_providers[0] if session_providers else "CPUExecutionProvider"
+        if enable_tensorrt and "TensorrtExecutionProvider" not in session_providers:
+            print("TensorRT provider unavailable, using CUDA/CPU fallback.")
+
         self.inputs = {}
         for inp in self.session.get_inputs():
             self.inputs[inp.name] = {
@@ -73,9 +145,6 @@ class ONNXRuntimeModel:
                 'shape': out.shape,
                 'dtype': out.type
             }
-
-        # Determine which execution provider is being used
-        self.provider = self.session.get_providers()[0]
 
         print(f"Loaded ONNX model: {self.onnx_path.name}")
         print(f"  Provider: {self.provider}")
@@ -122,8 +191,7 @@ class ONNXRuntimeModel:
         # Convert outputs back to PyTorch tensors
         outputs = {}
         for i, name in enumerate(output_names):
-            # Keep outputs on CPU if using CPU provider, otherwise move to GPU
-            device = 'cuda' if self.provider == 'CUDAExecutionProvider' else 'cpu'
+            device = 'cuda' if self._using_gpu_provider else 'cpu'
             outputs[name] = self._to_torch(onnx_outputs[i], device=device)
 
         return outputs
@@ -169,7 +237,13 @@ def find_onnx_model(model_name: str, cache_dir: Optional[str] = None) -> Optiona
 def load_onnx_model_if_available(
     model_name: str,
     cache_dir: Optional[str] = None,
-    use_gpu: bool = True
+    use_gpu: bool = True,
+    enable_tensorrt: bool = False,
+    trt_device_id: int = 0,
+    trt_workspace_size_mb: int = 4096,
+    trt_fp16: bool = True,
+    trt_int8: bool = False,
+    trt_cache_dir: Optional[str] = None,
 ) -> Optional[ONNXRuntimeModel]:
     """
     Load an ONNX model if available.
@@ -190,7 +264,16 @@ def load_onnx_model_if_available(
         return None
 
     try:
-        return ONNXRuntimeModel(str(onnx_path), use_gpu=use_gpu)
+        return ONNXRuntimeModel(
+            str(onnx_path),
+            use_gpu=use_gpu,
+            enable_tensorrt=enable_tensorrt,
+            trt_device_id=trt_device_id,
+            trt_workspace_size_mb=trt_workspace_size_mb,
+            trt_fp16=trt_fp16,
+            trt_int8=trt_int8,
+            trt_cache_dir=trt_cache_dir,
+        )
     except Exception as e:
         print(f"Failed to load ONNX model for {model_name}: {e}")
         return None
