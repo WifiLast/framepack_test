@@ -366,8 +366,21 @@ def get_sample_inputs_framepack_i2v(model: nn.Module, config: dict, device: str 
                 clean_latents_4x=None, clean_latent_4x_indices=None, image_embeddings=None,
                 attention_kwargs=None, return_dict=True)
     """
+    import os
+
     # Note: For ONNX export, we need to disable certain features that use dynamic operations
-    # like torch.meshgrid in rotary embeddings
+    # like torch.meshgrid in rotary embeddings and Triton kernels
+
+    # Disable Triton compilation which is incompatible with ONNX
+    os.environ['TRITON_DISABLE'] = '1'
+
+    # Set attention mode to standard (disable flash/sage attention)
+    try:
+        from diffusers_helper.models.hunyuan_video_packed import set_attention_accel_mode
+        set_attention_accel_mode('standard')
+        print("  Set attention acceleration mode to 'standard' for ONNX compatibility")
+    except:
+        pass
 
     # Temporarily disable model features that are incompatible with ONNX
     original_image_proj = getattr(model, 'image_projection', None)
@@ -375,6 +388,7 @@ def get_sample_inputs_framepack_i2v(model: nn.Module, config: dict, device: str 
     # Disable image projection to avoid meshgrid issues
     if hasattr(model, 'image_projection'):
         model.image_projection = None
+        print("  Disabled image_projection to avoid meshgrid issues")
 
     batch_size = 1
     in_channels = config.get('in_channels', 16)

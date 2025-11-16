@@ -996,6 +996,143 @@ print(args)
 if args.use_memory_v2:
     print("memory_v2 backend enabled (async streams, pinned memory, cached stats).")
 
+
+# ============================================================================
+# FLAG COMPATIBILITY VALIDATION
+# ============================================================================
+def validate_flag_compatibility():
+    """Validate and warn about incompatible flag combinations."""
+    warnings = []
+    errors = []
+
+    # Get all flags early (some are set later, so we check env vars too)
+    use_memory_v2 = args.use_memory_v2
+    enable_compile = os.environ.get("FRAMEPACK_ENABLE_COMPILE", "0") == "1"
+    enable_quant = os.environ.get("FRAMEPACK_ENABLE_QUANT")
+    use_bnb = os.environ.get("FRAMEPACK_USE_BNB", "0") == "1"
+    enable_tensorrt = args.enable_tensorrt
+    tensorrt_transformer = args.tensorrt_transformer
+    tensorrt_text = args.tensorrt_text_encoders
+    jit_mode = args.jit_mode
+    enable_fp8 = os.environ.get("FRAMEPACK_ENABLE_FP8", "0") == "1"
+
+    # CRITICAL: torch.compile + memory-v2 incompatibility
+    if enable_compile and use_memory_v2:
+        errors.append(
+            "⚠️  CRITICAL INCOMPATIBILITY: torch.compile + memory-v2\n"
+            "    torch.compile creates CUDA graphs that conflict with dynamic device copies in memory-v2\n"
+            "    Error: 'cudagraph partition due to DeviceCopy ops'\n"
+            "    SOLUTION: Choose ONE:\n"
+            "      1. Remove --use-memory-v2 flag (recommended for speed)\n"
+            "      2. Set FRAMEPACK_ENABLE_COMPILE=0 (recommended for low VRAM)\n"
+            "      3. Set TORCH_COMPILE_DISABLE_CUDAGRAPHS=1 (slower compile, works but defeats purpose)"
+        )
+
+    # TensorRT + BitsAndBytes incompatibility
+    if (enable_tensorrt or tensorrt_transformer or tensorrt_text) and use_bnb:
+        errors.append(
+            "⚠️  CRITICAL INCOMPATIBILITY: TensorRT + BitsAndBytes\n"
+            "    TensorRT requires FP16/BF16 precision, BitsAndBytes uses INT4/INT8\n"
+            "    SOLUTION: Choose ONE:\n"
+            "      1. Disable BitsAndBytes: FRAMEPACK_USE_BNB=0\n"
+            "      2. Disable TensorRT: --enable-tensorrt=False or unset flags\n"
+            "      3. Use FRAMEPACK_ENABLE_QUANT=1 instead of BitsAndBytes"
+        )
+
+    # torch.compile + TorchScript incompatibility
+    if enable_compile and jit_mode != "off":
+        warnings.append(
+            "⚠️  WARNING: torch.compile + TorchScript (--jit-mode)\n"
+            "    Both provide compilation, but use different approaches\n"
+            "    torch.compile will be skipped in favor of TorchScript\n"
+            "    RECOMMENDATION: Use torch.compile (better) - set --jit-mode off"
+        )
+
+    # Multiple quantization methods active
+    quant_methods = []
+    if enable_quant == "1":
+        quant_methods.append("INT-N quantization (FRAMEPACK_ENABLE_QUANT)")
+    if use_bnb:
+        quant_methods.append("BitsAndBytes (FRAMEPACK_USE_BNB)")
+    if enable_fp8:
+        quant_methods.append("FP8 quantization (FRAMEPACK_ENABLE_FP8)")
+
+    if len(quant_methods) > 1:
+        warnings.append(
+            f"⚠️  WARNING: Multiple quantization methods enabled:\n"
+            f"    {', '.join(quant_methods)}\n"
+            f"    These may conflict or apply redundantly\n"
+            f"    RECOMMENDATION: Choose ONE quantization method"
+        )
+
+    # TensorRT without required flags
+    if tensorrt_transformer or tensorrt_text:
+        if not enable_tensorrt:
+            warnings.append(
+                "⚠️  WARNING: TensorRT components enabled but --enable-tensorrt not set\n"
+                "    Text encoders/transformer TensorRT will be ignored\n"
+                "    SOLUTION: Add --enable-tensorrt flag"
+            )
+
+    # Fast start with optimizations that will be skipped
+    fast_start = args.fast_start or os.environ.get("FRAMEPACK_FAST_START", "0") == "1"
+    if fast_start:
+        skipped = []
+        if enable_compile:
+            skipped.append("torch.compile")
+        if os.environ.get("FRAMEPACK_ENABLE_OPT_CACHE", "0") == "1":
+            skipped.append("optimized model caching")
+
+        if skipped:
+            warnings.append(
+                f"ℹ️  INFO: Fast-start mode enabled - skipping:\n"
+                f"    {', '.join(skipped)}\n"
+                f"    Remove --fast-start for full optimizations"
+            )
+
+    # FP8 without proper hardware
+    if enable_fp8:
+        fp8_available = os.environ.get("FRAMEPACK_ENABLE_FP8") and FP8_UTILS_AVAILABLE
+        if not fp8_available:
+            warnings.append(
+                "⚠️  WARNING: FP8 enabled but utilities unavailable\n"
+                "    Requires third_party/fp8_optimization_utils.py\n"
+                "    FP8 will be disabled automatically"
+            )
+
+    # Print all warnings and errors
+    if errors or warnings:
+        print("\n" + "="*80)
+        print("FLAG COMPATIBILITY CHECK")
+        print("="*80)
+
+    for error in errors:
+        print(f"\n{error}\n")
+
+    for warning in warnings:
+        print(f"\n{warning}\n")
+
+    if errors:
+        print("="*80)
+        print("CRITICAL ERRORS DETECTED - The application may fail or behave unexpectedly")
+        print("Please resolve the incompatibilities above before proceeding")
+        print("="*80 + "\n")
+
+        # Don't exit, just warn - let user decide
+        import time
+        print("Waiting 5 seconds before continuing...")
+        time.sleep(5)
+    elif warnings:
+        print("="*80)
+        print("Configuration loaded with warnings - review recommendations above")
+        print("="*80 + "\n")
+
+    return len(errors) == 0
+
+
+# Run validation
+validate_flag_compatibility()
+
 FAST_START = args.fast_start or os.environ.get("FRAMEPACK_FAST_START", "0") == "1"
 PARALLEL_LOADERS = int(os.environ.get("FRAMEPACK_PARALLEL_LOADERS", "0"))
 if PARALLEL_LOADERS <= 1 and FAST_START:
