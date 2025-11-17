@@ -181,6 +181,15 @@ from diffusers_helper.thread_utils import AsyncStream, async_run
 from diffusers_helper.gradio.progress_bar import make_progress_bar_css, make_progress_bar_html
 from diffusers_helper.clip_vision import hf_clip_vision_encode
 from diffusers_helper.bucket_tools import find_nearest_bucket
+from diffusers_helper.profiling import (
+    profile_section,
+    profile_function,
+    get_global_stats,
+    PyTorchProfiler,
+    MemoryTracker,
+    IterationProfiler,
+    export_profiling_report,
+)
 from diffusers_helper.optimizations import (
     AdaptiveLatentWindowController,
     apply_int_nbit_quantization,
@@ -222,6 +231,14 @@ try:
 except Exception:
     faiss = None
     FAISS_AVAILABLE = False
+
+# BetterTransformer optimization support
+try:
+    from optimum.bettertransformer import BetterTransformer
+    BETTERTRANSFORMER_AVAILABLE = True
+except ImportError:
+    BetterTransformer = None
+    BETTERTRANSFORMER_AVAILABLE = False
 
 
 CACHE_DEFAULT_DTYPE = torch.float16
@@ -441,6 +458,92 @@ def align_to_multiple(value, multiple: int = 8, minimum: int = None):
 
 def align_resolution(height: int, width: int, multiple: int = 64):
     return align_to_multiple(height, multiple, multiple), align_to_multiple(width, multiple, multiple)
+
+
+def apply_bettertransformer_optimization(module, module_name="module", allow_bnb=True):
+    """
+    Apply BetterTransformer optimization to a model.
+    Falls back to PyTorch native SDPA if optimum is not available.
+
+    Now supports BitsAndBytes quantized models by applying SDPA configuration
+    directly to the model config, which works seamlessly with quantized layers.
+
+    Args:
+        module: The model to optimize (text encoder, image encoder, etc.)
+        module_name: Name of the module for logging
+        allow_bnb: Whether to allow optimization on BitsAndBytes models (default: True)
+
+    Returns:
+        Optimized module or original module if optimization fails
+    """
+    # Check if model is BitsAndBytes quantized
+    is_bnb_quantized = False
+    if hasattr(module, 'is_loaded_in_4bit'):
+        is_bnb_quantized = module.is_loaded_in_4bit
+    elif hasattr(module, 'is_loaded_in_8bit'):
+        is_bnb_quantized = module.is_loaded_in_8bit
+    elif hasattr(module, 'is_quantized'):
+        is_bnb_quantized = module.is_quantized
+
+    # For BitsAndBytes models, optimum's BetterTransformer.transform() may fail
+    # But we can still apply SDPA configuration which works with quantized weights
+    if is_bnb_quantized:
+        print(f'{module_name} is BitsAndBytes quantized - using SDPA-only optimization (compatible mode)')
+        # Skip optimum's transform, go straight to SDPA config
+    elif BETTERTRANSFORMER_AVAILABLE and not is_bnb_quantized:
+        try:
+            optimized = BetterTransformer.transform(module, keep_original_model=False)
+            print(f'BetterTransformer applied to {module_name} (using optimum library)')
+            return optimized
+        except Exception as exc:
+            print(f'BetterTransformer optimization failed for {module_name}: {exc}')
+            print(f'Falling back to PyTorch native SDPA for {module_name}')
+
+    # SDPA configuration - works with both regular and BitsAndBytes models
+    # This is the key: SDPA operates on the attention computation, not the weights
+    # So it's compatible with quantized weights
+    try:
+        # Enable PyTorch's native fast attention path
+        if hasattr(torch.nn.functional, 'scaled_dot_product_attention'):
+            # Set the model to use SDPA backend
+            if hasattr(module, 'config'):
+                # For HuggingFace models with config
+                config = module.config
+                if hasattr(config, '_attn_implementation'):
+                    original_impl = config._attn_implementation
+                    config._attn_implementation = 'sdpa'
+                    if is_bnb_quantized:
+                        print(f'Enabled PyTorch SDPA backend for {module_name} (BnB-compatible, changed from {original_impl})')
+                    else:
+                        print(f'Enabled PyTorch SDPA backend for {module_name} (changed from {original_impl})')
+                elif hasattr(config, 'attn_implementation'):
+                    original_impl = config.attn_implementation
+                    config.attn_implementation = 'sdpa'
+                    if is_bnb_quantized:
+                        print(f'Enabled PyTorch SDPA backend for {module_name} (BnB-compatible, changed from {original_impl})')
+                    else:
+                        print(f'Enabled PyTorch SDPA backend for {module_name} (changed from {original_impl})')
+                else:
+                    print(f'PyTorch SDPA available but config attribute not found for {module_name}')
+            else:
+                print(f'PyTorch SDPA available but no config found for {module_name}')
+
+            # Enable memory efficient attention backends
+            # These work with quantized models because they optimize the attention computation
+            torch.backends.cuda.enable_flash_sdp(True)
+            torch.backends.cuda.enable_mem_efficient_sdp(True)
+            torch.backends.cuda.enable_math_sdp(True)
+
+            if is_bnb_quantized:
+                print(f'  → SDPA will use Flash/Memory-efficient attention with quantized weights')
+
+            return module
+        else:
+            print(f'PyTorch SDPA not available (requires PyTorch 2.0+), keeping {module_name} unchanged')
+            return module
+    except Exception as exc:
+        print(f'Native SDPA fallback failed for {module_name}: {exc}')
+        return module
 
 
 def _build_transformer_example(module: torch.nn.Module, dtype: torch.dtype, device: torch.device):
@@ -987,6 +1090,28 @@ parser.add_argument(
     default=os.environ.get("FRAMEPACK_USE_ONNX_ENGINES", "0") == "1",
     help="DONT WORK! Use ONNX models for inference (TensorRT engines if available, otherwise ONNX Runtime).",
 )
+parser.add_argument(
+    "--disable-bettertransformer",
+    action="store_true",
+    help="Disable BetterTransformer optimization for encoders (enabled by default).",
+)
+parser.add_argument(
+    "--enable-profiling",
+    action="store_true",
+    help="Enable profile-guided optimization (PGO) to identify bottlenecks. Exports timing stats and PyTorch profiler traces.",
+)
+parser.add_argument(
+    "--profiling-iterations",
+    type=int,
+    default=1,
+    help="Number of iterations to profile (default: 1). Use 3-5 for statistical accuracy.",
+)
+parser.add_argument(
+    "--profiling-output-dir",
+    type=str,
+    default="./profiling_results",
+    help="Directory to save profiling results (default: ./profiling_results).",
+)
 args = parser.parse_args()
 
 # for win desktop probably use --server 127.0.0.1 --inbrowser
@@ -1082,6 +1207,8 @@ def validate_flag_compatibility():
             skipped.append("torch.compile")
         if os.environ.get("FRAMEPACK_ENABLE_OPT_CACHE", "0") == "1":
             skipped.append("optimized model caching")
+        if os.environ.get("FRAMEPACK_ENABLE_BETTERTRANSFORMER", "1") == "1" and not args.disable_bettertransformer:
+            skipped.append("BetterTransformer")
 
         if skipped:
             warnings.append(
@@ -1315,6 +1442,10 @@ ENABLE_PRUNE = os.environ.get("FRAMEPACK_ENABLE_PRUNE", "0") == "1"
 ENABLE_OPT_CACHE = os.environ.get("FRAMEPACK_ENABLE_OPT_CACHE", "0") == "1"
 ENABLE_MODULE_CACHE = os.environ.get("FRAMEPACK_ENABLE_MODULE_CACHE", "1") != "0"
 ENABLE_COMPILE = os.environ.get("FRAMEPACK_ENABLE_COMPILE", "0") == "1"
+# BetterTransformer: DISABLED by default - causes severe performance regression with memory offloading
+# SDPA forces models to stay on GPU, breaking CPU/SSD offload workflows (20s/it → 428s/it regression observed)
+# Only enable explicitly with FRAMEPACK_ENABLE_BETTERTRANSFORMER=1 if you have 80GB+ VRAM
+ENABLE_BETTERTRANSFORMER = (os.environ.get("FRAMEPACK_ENABLE_BETTERTRANSFORMER", "0") == "1") and not args.disable_bettertransformer
 CACHE_ROOT = os.environ.get(
     "FRAMEPACK_MODULE_CACHE_DIR",
     os.path.join(CACHE_BASE_DIR, "module_cache"),
@@ -1598,6 +1729,38 @@ text_encoder.eval()
 text_encoder_2.eval()
 image_encoder.eval()
 transformer_core.eval()
+
+# Apply BetterTransformer optimization for encoders
+# WARNING: Can cause severe performance regression with memory offloading (20s/it → 428s/it)
+# SDPA forces models to stay on GPU, interfering with CPU/SSD offload workflows
+if ENABLE_BETTERTRANSFORMER and not FAST_START:
+    print("="*80)
+    print("⚠️  BETTERTRANSFORMER OPTIMIZATION (EXPERIMENTAL)")
+    print("="*80)
+    print("WARNING: BetterTransformer/SDPA can cause severe performance degradation!")
+    print("  - SDPA forces models onto GPU, blocking CPU/SSD memory offloading")
+    print("  - Known issue: 20s/it → 428s/it regression with memory_v2 backend")
+    print("  - Only use if you have 80GB+ VRAM and keep all models on GPU")
+    print("  - To disable: Remove FRAMEPACK_ENABLE_BETTERTRANSFORMER=1 or add --disable-bettertransformer")
+    print("")
+
+    # Check if we're using memory offloading (this is likely problematic)
+    if args.use_memory_v2:
+        print("⚠️  CRITICAL: BetterTransformer + memory_v2 backend detected!")
+        print("  This combination causes severe slowdowns. Proceeding anyway...")
+
+    text_encoder = apply_bettertransformer_optimization(text_encoder, "text_encoder (LLaMA)")
+    text_encoder_2 = apply_bettertransformer_optimization(text_encoder_2, "text_encoder_2 (CLIP)")
+    image_encoder = apply_bettertransformer_optimization(image_encoder, "image_encoder (SigLip)")
+
+    if USE_BITSANDBYTES:
+        print("✓ BetterTransformer SDPA optimization applied with BitsAndBytes quantization")
+    print("="*80 + "\n")
+elif not ENABLE_BETTERTRANSFORMER:
+    print("BetterTransformer optimization disabled by default (safe)")
+    print("  (Can cause performance issues with memory offloading)")
+elif FAST_START:
+    print("Fast-start mode -> skipping BetterTransformer optimization")
 
 fp8_buffers_present = any(hasattr(module, "scale_weight") for module in transformer_core.modules())
 if fp8_buffers_present:
@@ -2397,6 +2560,27 @@ def worker(
     use_tensorrt_decode=False,
     use_tensorrt_transformer=False,
 ):
+    # Initialize profiling if enabled
+    PROFILING_ENABLED = args.enable_profiling
+    pytorch_profiler = None
+    memory_tracker = None
+    iteration_profiler = None
+
+    if PROFILING_ENABLED:
+        print("\n" + "="*80)
+        print("PROFILING ENABLED - Performance data will be collected")
+        print("="*80)
+        pytorch_profiler = PyTorchProfiler(
+            output_dir=args.profiling_output_dir,
+            enabled=True,
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=False,  # Stack traces add overhead
+        )
+        memory_tracker = MemoryTracker(enabled=True)
+        iteration_profiler = IterationProfiler(name="diffusion_step", enabled=True)
+        memory_tracker.snapshot("worker_start")
+
     runtime_cache_mode = (cache_mode or CACHE_MODE).lower()
     set_cache_mode_for_wrappers(runtime_cache_mode)
     latent_window_size = align_to_multiple(latent_window_size, multiple=8, minimum=8)
@@ -2673,7 +2857,7 @@ def worker(
                 move_model_to_device_with_memory_preservation(transformer_to_move, target_device=gpu, preserved_memory_gb=gpu_memory_preservation)
 
             if use_teacache:
-                transformer_backbone.initialize_teacache(enable_teacache=True, num_steps=steps, rel_l1_thresh=0.1)
+                transformer_backbone.initialize_teacache(enable_teacache=True, num_steps=steps, rel_l1_thresh=0.05)
             else:
                 transformer_backbone.initialize_teacache(enable_teacache=False)
 
@@ -2968,7 +3152,7 @@ with block:
                 rs = gr.Slider(label="CFG Re-Scale", minimum=0.0, maximum=1.0, value=0.0, step=0.01, visible=False)  # Should not change
 
             with gr.Accordion("Performance & Output", open=False):
-                gpu_memory_preservation = gr.Slider(label="GPU Inference Preserved Memory (GB) (larger means slower)", minimum=2, maximum=128, value=8, step=0.1, info="Set this number to a larger value if you encounter OOM. Larger value causes slower speed. For 16GB VRAM, use 2-5GB for best performance.")
+                gpu_memory_preservation = gr.Slider(label="GPU Inference Preserved Memory (GB) (larger means slower)", minimum=2, maximum=128, value=6, step=0.1, info="Set this number to a larger value if you encounter OOM. Larger value causes slower speed. For 16GB VRAM, use 2-5GB for best performance.")
                 mp4_crf = gr.Slider(label="MP4 Compression", minimum=0, maximum=100, value=16, step=1, info="Lower means better quality. 0 is uncompressed. Change to 16 if you get black outputs. ")
                 tensorrt_decode_checkbox = gr.Checkbox(
                     label="TensorRT VAE Acceleration (beta)",

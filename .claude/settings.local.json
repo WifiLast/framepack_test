@@ -6,7 +6,9 @@
       "Bash(python:*)",
       "Bash(chmod:*)",
       "Bash(git checkout:*)",
-      "Bash(nul)"
+      "Bash(nul)",
+      "Bash(pip show:*)",
+      "Bash(pip install:*)"
     ],
     "deny": [],
     "ask": []
