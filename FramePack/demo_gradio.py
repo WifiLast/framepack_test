@@ -1139,7 +1139,7 @@ def validate_flag_compatibility():
     tensorrt_transformer = args.tensorrt_transformer
     tensorrt_text = args.tensorrt_text_encoders
     jit_mode = args.jit_mode
-    enable_fp8 = os.environ.get("FRAMEPACK_ENABLE_FP8", "0") == "1"
+    enable_fp8 = os.environ.get("FRAMEPACK_ENABLE_FP8", "1") == "1"
 
     # CRITICAL: torch.compile + memory-v2 incompatibility
     if enable_compile and use_memory_v2:
@@ -2562,24 +2562,29 @@ def worker(
 ):
     # Initialize profiling if enabled
     PROFILING_ENABLED = args.enable_profiling
-    pytorch_profiler = None
     memory_tracker = None
     iteration_profiler = None
 
     if PROFILING_ENABLED:
-        print("\n" + "="*80)
-        print("PROFILING ENABLED - Performance data will be collected")
-        print("="*80)
-        pytorch_profiler = PyTorchProfiler(
-            output_dir=args.profiling_output_dir,
-            enabled=True,
-            record_shapes=True,
-            profile_memory=True,
-            with_stack=False,  # Stack traces add overhead
-        )
-        memory_tracker = MemoryTracker(enabled=True)
-        iteration_profiler = IterationProfiler(name="diffusion_step", enabled=True)
-        memory_tracker.snapshot("worker_start")
+        try:
+            print("\n" + "="*80)
+            print("PROFILING ENABLED - Performance data will be collected")
+            print("="*80)
+            # Note: PyTorch profiler disabled - causes crashes with complex workflows
+            # Using lightweight timing stats and memory tracking instead
+            # This provides comprehensive performance data without crashing
+            memory_tracker = MemoryTracker(enabled=True)
+            iteration_profiler = IterationProfiler(name="diffusion_step", enabled=True)
+            memory_tracker.snapshot("worker_start")
+            print("Profiling initialized successfully:")
+            print("  - Timing statistics: Enabled (via profile_section)")
+            print("  - Memory tracking: Enabled (GPU VRAM usage)")
+            print("  - Iteration profiling: Enabled (per-step timing)")
+            print("="*80)
+        except Exception as e:
+            print(f"Warning: Failed to initialize profiling: {e}")
+            print("Continuing without profiling...")
+            PROFILING_ENABLED = False
 
     runtime_cache_mode = (cache_mode or CACHE_MODE).lower()
     set_cache_mode_for_wrappers(runtime_cache_mode)
@@ -2892,9 +2897,8 @@ def worker(
                 return
 
             with profile_section(f"sampling_chunk_{chunk_index}", enabled=PROFILING_ENABLED):
-                if PROFILING_ENABLED and pytorch_profiler and chunk_index == 0:
-                    # Start PyTorch profiler for first chunk
-                    pytorch_profiler.start(f"sampling_trace_{job_id}")
+                # Note: PyTorch profiler disabled - causes crashes
+                # Only using lightweight timing stats instead
 
                 with inference_autocast():
                     generated_latents = sample_hunyuan(
@@ -3024,19 +3028,28 @@ def worker(
         print("PROFILING COMPLETE - Exporting Results")
         print("="*80)
 
-        # Stop PyTorch profiler if it was started
-        if pytorch_profiler:
-            try:
-                pytorch_profiler.stop()
-            except Exception as e:
-                print(f"Warning: Failed to stop PyTorch profiler: {e}")
+        # Note: PyTorch profiler disabled (was causing crashes)
+        # Using lightweight timing stats and memory tracking only
 
         # Print timing summary
-        get_global_stats().print_summary(top_n=30)
+        try:
+            get_global_stats().print_summary(top_n=30)
+        except Exception as e:
+            print(f"Warning: Failed to print timing summary: {e}")
 
         # Print memory summary
         if memory_tracker:
-            memory_tracker.print_summary()
+            try:
+                memory_tracker.print_summary()
+            except Exception as e:
+                print(f"Warning: Failed to print memory summary: {e}")
+
+        # Print iteration profiler stats
+        if iteration_profiler:
+            try:
+                iteration_profiler.print_summary()
+            except Exception as e:
+                print(f"Warning: Failed to print iteration summary: {e}")
 
         # Export comprehensive report
         try:
@@ -3048,11 +3061,10 @@ def worker(
             )
             print(f"\nProfiling data saved to: {args.profiling_output_dir}")
             print(f"  - JSON report: {report_path}")
-            print(f"  - Chrome traces: {args.profiling_output_dir}/sampling_trace_*.json")
-            print("\nTo view Chrome traces:")
-            print("  1. Open Chrome browser")
-            print("  2. Go to: chrome://tracing")
-            print(f"  3. Load: {args.profiling_output_dir}/sampling_trace_*.json")
+            print("\nThe report includes:")
+            print("  - Timing statistics for all operations")
+            print("  - Memory usage snapshots")
+            print("  - Iteration-by-iteration performance data")
         except Exception as e:
             print(f"Warning: Failed to export profiling report: {e}")
 
@@ -3275,4 +3287,5 @@ block.launch(
     server_port=args.port,
     share=args.share,
     inbrowser=args.inbrowser,
+    root_path=os.environ.get("GRADIO_ROOT_PATH", ""),  # Fix for RunPod/proxy environments
 )

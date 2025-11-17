@@ -405,4 +405,5 @@ block.launch(
     server_port=args.port,
     share=args.share,
     inbrowser=args.inbrowser,
+    root_path=os.environ.get("GRADIO_ROOT_PATH", ""),  # Fix for RunPod/proxy environments
 )

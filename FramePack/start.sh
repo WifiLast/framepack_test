@@ -23,8 +23,8 @@ PYTORCH_ENABLE_MEM_EFFICIENT_SDP=0 PYTORCH_ENABLE_FLASH_SDP=0 FRAMEPACK_PRELOAD_
 #FRAMEPACK_TRT_WORKSPACE_MB=1024 PYTORCH_ENABLE_MEM_EFFICIENT_SDP=0 PYTORCH_ENABLE_FLASH_SDP=0 FRAMEPACK_PRELOAD_REPOS=0 FRAMEPACK_FAST_START=0 FRAMEPACK_USE_BNB=0 FRAMEPACK_BNB_LOAD_IN_4BIT=0 FRAMEPACK_BNB_CPU_OFFLOAD=1 FRAMEPACK_VAE_CHUNK_SIZE=2 python demo_gradio.py --fast-start --xformers-mode aggressive --use-memory-v2 --enable-tensorrt --tensorrt-transformer
 
 # --tensorrt-text-encoders
-    --enable-profiling \
-    --profiling-iterations 5 \
-    --profiling-output-dir ./my_profile
+
+# FRAMEPACK_ENABLE_BETTERTRANSFORMER=1
+--enable-profiling  --profiling-iterations 5 --profiling-output-dir ./my_profile
 
 python demo_gradio.py --fast-start --enable-tensorrt --tensorrt-transformer --use-memory-v2
