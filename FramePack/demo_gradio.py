@@ -3465,48 +3465,49 @@ def worker(
 
         # After generation, run the training step if enabled
         if RELATIONSHIP_TRAINER_ENABLED_FOR_RUN and block_io_data:
-            print(f"\nTraining {normalized_trainer_mode} relationship trainer on {len(block_io_data)} tuples...")
-            if normalized_trainer_mode == "hidden_state" and relationship_trainer is not None:
-                total_loss, processed = _train_hidden_state_samples(block_io_data, relationship_trainer, trainer_batch_size)
-                if processed > 0:
-                    avg_loss = total_loss / processed
-                    print(f"Hidden-state trainer updated on {processed} samples; avg loss={avg_loss:.6f}")
-                    print("Persisting relationship trainer state to disk...")
-                    _save_runtime_cache_state("relationship_trainer", relationship_trainer.state_dict())
+            with torch.inference_mode(False):
+                print(f"\nTraining {normalized_trainer_mode} relationship trainer on {len(block_io_data)} tuples...")
+                if normalized_trainer_mode == "hidden_state" and relationship_trainer is not None:
+                    total_loss, processed = _train_hidden_state_samples(block_io_data, relationship_trainer, trainer_batch_size)
+                    if processed > 0:
+                        avg_loss = total_loss / processed
+                        print(f"Hidden-state trainer updated on {processed} samples; avg loss={avg_loss:.6f}")
+                        print("Persisting relationship trainer state to disk...")
+                        _save_runtime_cache_state("relationship_trainer", relationship_trainer.state_dict())
+                    else:
+                        print("Hidden-state trainer skipped (no valid samples).")
+                elif normalized_trainer_mode == "residual":
+                    total_loss, processed = _train_residual_predictors(
+                        block_io_data,
+                        transformer_backbone,
+                        rt_learning_rate,
+                        trainer_batch_size,
+                        gpu,
+                    )
+                    if processed > 0:
+                        avg_loss = total_loss / processed
+                        print(f"Residual predictors updated on {processed} samples; avg loss={avg_loss:.6f}")
+                        residual_payload = _export_relationship_trainer_states(RESIDUAL_TRAINERS, RESIDUAL_TRAINER_STATES)
+                        _save_runtime_cache_state(RELATIONSHIP_RESIDUAL_CACHE_NAME, residual_payload)
+                    else:
+                        print("Residual predictor training skipped (no valid samples).")
+                elif normalized_trainer_mode == "modulation":
+                    total_loss, processed = _train_modulation_predictors(
+                        block_io_data,
+                        transformer_backbone,
+                        rt_learning_rate,
+                        trainer_batch_size,
+                        gpu,
+                    )
+                    if processed > 0:
+                        avg_loss = total_loss / processed
+                        print(f"Modulation predictors updated on {processed} samples; avg loss={avg_loss:.6f}")
+                        modulation_payload = _export_relationship_trainer_states(MODULATION_TRAINERS, MODULATION_TRAINER_STATES)
+                        _save_runtime_cache_state(RELATIONSHIP_MODULATION_CACHE_NAME, modulation_payload)
+                    else:
+                        print("Modulation predictor training skipped (no valid samples).")
                 else:
-                    print("Hidden-state trainer skipped (no valid samples).")
-            elif normalized_trainer_mode == "residual":
-                total_loss, processed = _train_residual_predictors(
-                    block_io_data,
-                    transformer_backbone,
-                    rt_learning_rate,
-                    trainer_batch_size,
-                    gpu,
-                )
-                if processed > 0:
-                    avg_loss = total_loss / processed
-                    print(f"Residual predictors updated on {processed} samples; avg loss={avg_loss:.6f}")
-                    residual_payload = _export_relationship_trainer_states(RESIDUAL_TRAINERS, RESIDUAL_TRAINER_STATES)
-                    _save_runtime_cache_state(RELATIONSHIP_RESIDUAL_CACHE_NAME, residual_payload)
-                else:
-                    print("Residual predictor training skipped (no valid samples).")
-            elif normalized_trainer_mode == "modulation":
-                total_loss, processed = _train_modulation_predictors(
-                    block_io_data,
-                    transformer_backbone,
-                    rt_learning_rate,
-                    trainer_batch_size,
-                    gpu,
-                )
-                if processed > 0:
-                    avg_loss = total_loss / processed
-                    print(f"Modulation predictors updated on {processed} samples; avg loss={avg_loss:.6f}")
-                    modulation_payload = _export_relationship_trainer_states(MODULATION_TRAINERS, MODULATION_TRAINER_STATES)
-                    _save_runtime_cache_state(RELATIONSHIP_MODULATION_CACHE_NAME, modulation_payload)
-                else:
-                    print("Modulation predictor training skipped (no valid samples).")
-            else:
-                print(f"No trainer registered for mode '{normalized_trainer_mode}'.")
+                    print(f"No trainer registered for mode '{normalized_trainer_mode}'.")
 
             block_io_data.clear()
 
