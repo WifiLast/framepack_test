@@ -582,6 +582,62 @@ print(TENSORRT_DECODER._cache.keys())
 # Output: [(1, 18, 80, 80, torch.float16), ...]
 ```
 
+### Timestep Residual Predictor (Alternative Relationship Trainer)
+
+Use the lightweight predictor in `diffusers_helper/relationship_trainer.py` when you want to keep the DiT weights frozen but still capture the timestep-modulation path:
+
+```python
+from diffusers_helper.relationship_trainer import DiTTimestepResidualTrainer
+
+block = transformer.transformer_blocks[idx]
+trainer = DiTTimestepResidualTrainer(block, hidden_dim=hidden_size, temb_dim=temb.shape[-1])
+
+loss = trainer.train_step(
+    hidden_states,
+    encoder_hidden_states,
+    temb,
+    attention_mask=attention_mask,
+    freqs_cis=freqs_cis,
+)
+
+with torch.no_grad():
+    approx_hidden, approx_context = trainer.approximate_forward(
+        hidden_states,
+        encoder_hidden_states,
+        temb,
+        freqs_cis=freqs_cis,
+    )
+```
+
+- The block is never updated—only the predictor parameters φ are trained with MSE on Δh = h_full − h_base.
+- `h_base` is computed by replaying the block with neutral modulation (γ=1, β=0).
+- During inference replace the timestep branch with `h_base + gφ(h_in, T_t)` for stable behavior that keeps the base structure intact.
+
+### Timestep Modulation Replacement
+
+Freeze the DiT block and distill only its AdaLN/FiLM timestep MLP:
+
+```python
+from diffusers_helper.relationship_trainer import DiTTimestepModulationTrainer
+
+block = transformer.transformer_blocks[idx]
+trainer = DiTTimestepModulationTrainer(
+    block,
+    temb_dim=temb.shape[-1],
+    mod_dim=hidden_size,
+)
+
+loss = trainer.train_step(temb)  # collect (t, gamma(t), beta(t))
+
+with torch.no_grad():
+    gamma_hat, beta_hat = trainer.predict(temb)
+    # plug gamma_hat/beta_hat back into your AdaLN implementation
+```
+
+- The trainer records the original modulation vectors γ(t) and β(t) produced by `block.norm1` (or `norm` for single blocks).
+- `DiTTimestepModulationPredictor` is a tiny MLP over the timestep embedding, so evaluating γ̂/β̂ is cheaper than running the original modulation network.
+- After convergence you can bypass the DiT block’s internal timestep linear layers and feed γ̂/β̂ directly, keeping attention/FFN weights intact.
+
 ---
 
 ## See Also
