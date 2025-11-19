@@ -1208,7 +1208,7 @@ def validate_flag_compatibility():
             skipped.append("torch.compile")
         if os.environ.get("FRAMEPACK_ENABLE_OPT_CACHE", "0") == "1":
             skipped.append("optimized model caching")
-        if os.environ.get("FRAMEPACK_ENABLE_BETTERTRANSFORMER", "1") == "1" and not args.disable_bettertransformer:
+        if os.environ.get("FRAMEPACK_ENABLE_BETTERTRANSFORMER", "0") == "1" and not args.disable_bettertransformer:
             skipped.append("BetterTransformer")
 
         if skipped:
