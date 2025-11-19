@@ -997,6 +997,8 @@ class HunyuanVideoTransformer3DModelPacked(ModelMixin, ConfigMixin, PeftAdapterM
         self.previous_modulated_input = None
         self.previous_residual = None
         self.teacache_rescale_func = np.poly1d([7.33226126e+02, -4.01131952e+02, 6.75869174e+01, -3.14987800e+00, 9.61237896e-02])
+        self.max_teacache_delta = 0.0
+        self.last_teacache_delta = None
 
     def gradient_checkpointing_method(self, block, *args):
         if self.use_gradient_checkpointing:
@@ -1121,6 +1123,7 @@ class HunyuanVideoTransformer3DModelPacked(ModelMixin, ConfigMixin, PeftAdapterM
         if self.enable_teacache:
             current_step_idx = getattr(self, "cnt", 0)
             modulated_inp = self.transformer_blocks[0].norm1(hidden_states, emb=temb)[0]
+            curr_rel_l1 = None
 
             if self.cnt == 0 or self.cnt == self.num_steps-1:
                 should_calc = True
@@ -1132,6 +1135,11 @@ class HunyuanVideoTransformer3DModelPacked(ModelMixin, ConfigMixin, PeftAdapterM
 
                 if should_calc:
                     self.accumulated_rel_l1_distance = 0
+                self.last_teacache_delta = curr_rel_l1
+                if curr_rel_l1 is not None:
+                    self.max_teacache_delta = max(self.max_teacache_delta, curr_rel_l1)
+            if curr_rel_l1 is None:
+                self.last_teacache_delta = None
 
             self.previous_modulated_input = modulated_inp
             self.cnt += 1
@@ -1140,7 +1148,11 @@ class HunyuanVideoTransformer3DModelPacked(ModelMixin, ConfigMixin, PeftAdapterM
                 self.cnt = 0
 
             if not should_calc:
-                self._record_cache_event("teacache", {"step": current_step_idx})
+                meta = {"step": current_step_idx}
+                if self.last_teacache_delta is not None:
+                    meta["delta_dynamic"] = self.last_teacache_delta
+                    meta["max_delta_dynamic"] = getattr(self, "max_teacache_delta", self.last_teacache_delta)
+                self._record_cache_event("teacache", meta)
                 hidden_states = hidden_states + self.previous_residual
             else:
                 ori_hidden_states = hidden_states.clone()

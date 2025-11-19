@@ -126,10 +126,10 @@ class CacheEventRecorder:
         if not self._timeline:
             return "No cache hits recorded yet."
         lines = [
-            "| Time (s) | Cache | Details |",
-            "| --- | --- | --- |",
+            "| Time (s) | Frame | Cache | Details |",
+            "| --- | --- | --- | --- |",
         ]
         for event in self._timeline:
             details = _format_meta(event.meta)
-            lines.append(f"| {event.time_seconds:.2f} | {event.cache_type} | {details} |")
+            lines.append(f"| {event.time_seconds:.2f} | {event.time_frame:.0f} | {event.cache_type} | {details} |")
         return "\n".join(lines)
