@@ -1,0 +1,166 @@
+(venv) root@28716d3199be:/workspace/framepack_cython/FramePack# PYTORCH_ENABLE_MEM_EFFICIENT_SDP=1 PYTORCH_ENABLE_FLASH_SDP=1 FRAMEPACK_PRELOAD_REPOS=0 FRAMEPACK_FAST_START=0 FRAMEPACK_USE_BNB=1 FRAMEPACK_BNB_LOAD_IN_4BIT=1 FRAMEPACK_BNB_CPU_OFFLOAD=0 FRAMEPACK_VAE_CHUNK_SIZE=2 python demo_gradio.py --xformers-mode aggressive --use-memory-v2
+Currently enabled native sdp backends: ['flash', 'math', 'mem_efficient', 'cudnn']
+Xformers is not installed!
+Flash Attn is not installed!
+Sage Attn is installed!
+TensorRT-LLM is not installed. Please install TensorRT-LLM or set TRTLLM_PLUGINS_PATH to the directory containing libnvinfer_plugin_tensorrt_llm.so to use converters for torch.distributed ops
+Namespace(share=False, server='0.0.0.0', port=None, inbrowser=False, cache_mode='semantic', jit_mode='off', disable_fbcache=False, disable_sim_cache=False, disable_kv_cache=False, xformers_mode='aggressive', fast_start=False, use_memory_v2=True, enforce_low_precision=False, enable_tensorrt=False, tensorrt_transformer=False, tensorrt_text_encoders=False, use_onnx_engines=False, disable_bettertransformer=False, enable_profiling=False, profiling_iterations=1, profiling_output_dir='./profiling_results')
+memory_v2 backend enabled (async streams, pinned memory, cached stats).
+
+================================================================================
+FLAG COMPATIBILITY CHECK
+================================================================================
+
+⚠️  WARNING: Multiple quantization methods enabled:
+    BitsAndBytes (FRAMEPACK_USE_BNB), FP8 quantization (FRAMEPACK_ENABLE_FP8)
+    These may conflict or apply redundantly
+    RECOMMENDATION: Choose ONE quantization method
+
+
+⚠️  WARNING: FP8 enabled but utilities unavailable
+    Requires third_party/fp8_optimization_utils.py
+    FP8 will be disabled automatically
+
+================================================================================
+Configuration loaded with warnings - review recommendations above
+================================================================================
+
+DEBUG: ENABLE_TENSORRT_RUNTIME = False
+DEBUG: TRT_TRANSFORMER_ENABLED = False
+DEBUG: TRT_TEXT_ENCODERS_ENABLED = False
+DEBUG: USE_ONNX_ENGINES = False
+CPU-side preprocessing acceleration enabled (SIMD/OpenCV + oneDAL).
+Free VRAM 30.87384033203125 GB
+High-VRAM Mode: False
+FRAMEPACK_ENABLE_QUANT not set -> skipping module quantization by default.
+BitsAndBytes quantization enabled (4bit) with device_map=auto.
+Loading text encoder...
+Loading checkpoint shards: 100%|███████████████████████████████████████████████████████████████████████████████████████████████| 4/4 [00:41<00:00, 10.30s/it]
+text encoder ready.
+Loading clip text encoder...
+clip text encoder ready.
+Loading VAE...
+VAE ready.
+Loading SigLip image encoder...
+`torch_dtype` is deprecated! Use `dtype` instead!
+SigLip image encoder ready.
+Set text_encoder.config.output_hidden_states = True
+Fetching 3 files: 100%|██████████████████████████████████████████████████████████████████████████████████████████████████████| 3/3 [00:00<00:00, 3843.28it/s]
+Loading checkpoint shards: 100%|███████████████████████████████████████████████████████████████████████████████████████████████| 3/3 [00:05<00:00,  1.69s/it]
+BetterTransformer optimization disabled by default (safe)
+  (Can cause performance issues with memory offloading)
+DEBUG: About to check ENABLE_TENSORRT_RUNTIME = False
+TensorRT runtime disabled (use --enable-tensorrt to opt-in).
+First block cache enabled (threshold=0.0350).
+Loaded persisted first-block cache state.
+Similarity cache enabled (threshold=0.800, max_skip=1, entries=12).
+Loaded persisted similarity cache state.
+Warning: Could not initialize HiddenStateRelationshipTrainer: argument of type 'torch.device' is not iterable
+FRAMEPACK_ENABLE_QUANT not set -> skipping module quantization.
+Low precision enforcement disabled; models retain their loaded precision.
+DEBUG: Reached compilation check point
+FRAMEPACK_ENABLE_COMPILE=0 -> skipping torch.compile for encoders.
+FRAMEPACK_ENABLE_COMPILE=0 -> skipping torch.compile for transformer.
+FRAMEPACK_ENABLE_PRUNE=0 -> skipping transformer pruning.
+self.use_gradient_checkpointing = True
+transformer.high_quality_fp32_output_for_inference = False
+* Running on local URL:  http://0.0.0.0:7860
+
+To create a public link, set `share=True` in `launch()`.
+Relationship trainer mode 'residual' enabled (lr=1.00e-04, batch=256). Capturing block tuples.
+Unloaded ModuleCacheWrapper as complete.
+Unloaded AutoencoderKLHunyuanVideo as complete.
+Unloaded DynamicSwap_HunyuanVideoTransformer3DModelPacked as complete.
+Applied slow-motion hint to prompt: "move slowly, slow motion, gentle pacing, graceful deliberate movements".
+DEBUG: Preserving object with hidden_states, type=BaseModelOutputWithPooling
+DEBUG: Original has hidden_states: False
+DEBUG: Reconstructed has hidden_states: False
+Loaded AutoencoderKLHunyuanVideo to cuda:0 as complete.
+Unloaded AutoencoderKLHunyuanVideo as complete.
+Loaded ModuleCacheWrapper to cuda:0 as complete.
+DEBUG: Preserving object with hidden_states, type=BaseModelOutputWithPooling
+DEBUG: Original has hidden_states: False
+DEBUG: Reconstructed has hidden_states: False
+latent_padding_size = 16, is_last_section = False
+Unloaded ModuleCacheWrapper as complete.
+Moving DynamicSwap_HunyuanVideoTransformer3DModelPacked to cuda:0 with preserved memory: 6 GB
+DEBUG fm_wrapper: transformer type = DynamicSwap_HunyuanVideoTransformer3DModelPacked
+  0%|                                                                                                                                 | 0/25 [00:00<?, ?it/s]DEBUG fm_wrapper k_model: About to call transformer, type = DynamicSwap_HunyuanVideoTransformer3DModelPacked
+  4%|████▊                                                                                                                    | 1/25 [00:15<06:11, 15.46s/it]DEBUG fm_wrapper k_model: About to call transformer, type = DynamicSwap_HunyuanVideoTransformer3DModelPacked
+  8%|█████████▋                                                                                                               | 2/25 [00:19<03:27,  9.03s/it]DEBUG fm_wrapper k_model: About to call transformer, type = DynamicSwap_HunyuanVideoTransformer3DModelPacked
+ 12%|██████████████▌                                                                                                          | 3/25 [00:24<02:35,  7.08s/it]DEBUG fm_wrapper k_model: About to call transformer, type = DynamicSwap_HunyuanVideoTransformer3DModelPacked
+ 16%|███████████████████▎                                                                                                     | 4/25 [00:29<02:08,  6.13s/it]DEBUG fm_wrapper k_model: About to call transformer, type = DynamicSwap_HunyuanVideoTransformer3DModelPacked
+ 20%|████████████████████████▏                                                                                                | 5/25 [00:33<01:50,  5.55s/it]DEBUG fm_wrapper k_model: About to call transformer, type = DynamicSwap_HunyuanVideoTransformer3DModelPacked
+ 24%|█████████████████████████████                                                                                            | 6/25 [00:38<01:38,  5.19s/it]DEBUG fm_wrapper k_model: About to call transformer, type = DynamicSwap_HunyuanVideoTransformer3DModelPacked
+ 28%|█████████████████████████████████▉                                                                                       | 7/25 [00:42<01:29,  4.97s/it]DEBUG fm_wrapper k_model: About to call transformer, type = DynamicSwap_HunyuanVideoTransformer3DModelPacked
+ 32%|██████████████████████████████████████▋                                                                                  | 8/25 [00:47<01:22,  4.83s/it]DEBUG fm_wrapper k_model: About to call transformer, type = DynamicSwap_HunyuanVideoTransformer3DModelPacked
+ 36%|███████████████████████████████████████████▌                                                                             | 9/25 [00:52<01:15,  4.73s/it]DEBUG fm_wrapper k_model: About to call transformer, type = DynamicSwap_HunyuanVideoTransformer3DModelPacked
+ 40%|████████████████████████████████████████████████                                                                        | 10/25 [00:56<01:10,  4.67s/it]DEBUG fm_wrapper k_model: About to call transformer, type = DynamicSwap_HunyuanVideoTransformer3DModelPacked
+ 44%|████████████████████████████████████████████████████▊                                                                   | 11/25 [01:01<01:04,  4.63s/it]DEBUG fm_wrapper k_model: About to call transformer, type = DynamicSwap_HunyuanVideoTransformer3DModelPacked
+ 48%|█████████████████████████████████████████████████████████▌                                                              | 12/25 [01:05<00:59,  4.60s/it]DEBUG fm_wrapper k_model: About to call transformer, type = DynamicSwap_HunyuanVideoTransformer3DModelPacked
+ 52%|██████████████████████████████████████████████████████████████▍                                                         | 13/25 [01:10<00:54,  4.58s/it]DEBUG fm_wrapper k_model: About to call transformer, type = DynamicSwap_HunyuanVideoTransformer3DModelPacked
+ 56%|███████████████████████████████████████████████████████████████████▏                                                    | 14/25 [01:14<00:50,  4.57s/it]DEBUG fm_wrapper k_model: About to call transformer, type = DynamicSwap_HunyuanVideoTransformer3DModelPacked
+ 60%|████████████████████████████████████████████████████████████████████████                                                | 15/25 [01:19<00:45,  4.60s/it]DEBUG fm_wrapper k_model: About to call transformer, type = DynamicSwap_HunyuanVideoTransformer3DModelPacked
+ 64%|████████████████████████████████████████████████████████████████████████████▊                                           | 16/25 [01:23<00:41,  4.58s/it]DEBUG fm_wrapper k_model: About to call transformer, type = DynamicSwap_HunyuanVideoTransformer3DModelPacked
+ 68%|█████████████████████████████████████████████████████████████████████████████████▌                                      | 17/25 [01:28<00:36,  4.61s/it]DEBUG fm_wrapper k_model: About to call transformer, type = DynamicSwap_HunyuanVideoTransformer3DModelPacked
+ 72%|██████████████████████████████████████████████████████████████████████████████████████▍                                 | 18/25 [01:33<00:32,  4.59s/it]DEBUG fm_wrapper k_model: About to call transformer, type = DynamicSwap_HunyuanVideoTransformer3DModelPacked
+ 76%|███████████████████████████████████████████████████████████████████████████████████████████▏                            | 19/25 [01:37<00:27,  4.58s/it]DEBUG fm_wrapper k_model: About to call transformer, type = DynamicSwap_HunyuanVideoTransformer3DModelPacked
+ 80%|████████████████████████████████████████████████████████████████████████████████████████████████                        | 20/25 [01:42<00:22,  4.56s/it]DEBUG fm_wrapper k_model: About to call transformer, type = DynamicSwap_HunyuanVideoTransformer3DModelPacked
+ 84%|████████████████████████████████████████████████████████████████████████████████████████████████████▊                   | 21/25 [01:46<00:18,  4.56s/it]DEBUG fm_wrapper k_model: About to call transformer, type = DynamicSwap_HunyuanVideoTransformer3DModelPacked
+ 88%|█████████████████████████████████████████████████████████████████████████████████████████████████████████▌              | 22/25 [01:51<00:13,  4.56s/it]DEBUG fm_wrapper k_model: About to call transformer, type = DynamicSwap_HunyuanVideoTransformer3DModelPacked
+ 92%|██████████████████████████████████████████████████████████████████████████████████████████████████████████████▍         | 23/25 [01:55<00:09,  4.55s/it]DEBUG fm_wrapper k_model: About to call transformer, type = DynamicSwap_HunyuanVideoTransformer3DModelPacked
+ 96%|███████████████████████████████████████████████████████████████████████████████████████████████████████████████████▏    | 24/25 [02:00<00:04,  4.55s/it]DEBUG fm_wrapper k_model: About to call transformer, type = DynamicSwap_HunyuanVideoTransformer3DModelPacked
+100%|████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 25/25 [02:04<00:00,  5.00s/it]
+Offloading DynamicSwap_HunyuanVideoTransformer3DModelPacked from cuda:0 to preserve memory: 8 GB
+Force freeing VRAM to reach 10.0 GB...
+After clearing: 25.89 GB free
+Loaded AutoencoderKLHunyuanVideo to cuda:0 as complete.
+Unloaded AutoencoderKLHunyuanVideo as complete.
+Force freeing VRAM to reach 2.0 GB...
+After clearing: 25.89 GB free
+Decoded. Current latent shape torch.Size([1, 16, 16, 64, 96]); pixel shape torch.Size([1, 3, 40, 512, 768])
+Attempting to save runtime cache for "first_block_cache" to: /workspace/framepack_cython/FramePack/Cache/runtime_caches/first_block_cache.pt
+Successfully saved runtime cache for "first_block_cache".
+Attempting to save runtime cache for "similarity_cache" to: /workspace/framepack_cython/FramePack/Cache/runtime_caches/similarity_cache.pt
+Successfully saved runtime cache for "similarity_cache".
+latent_padding_size = 0, is_last_section = True
+Moving DynamicSwap_HunyuanVideoTransformer3DModelPacked to cuda:0 with preserved memory: 6 GB
+DEBUG fm_wrapper: transformer type = DynamicSwap_HunyuanVideoTransformer3DModelPacked
+  0%|                                                                                                                                 | 0/25 [00:00<?, ?it/s]DEBUG fm_wrapper k_model: About to call transformer, type = DynamicSwap_HunyuanVideoTransformer3DModelPacked
+  4%|████▊                                                                                                                    | 1/25 [00:04<01:48,  4.54s/it]DEBUG fm_wrapper k_model: About to call transformer, type = DynamicSwap_HunyuanVideoTransformer3DModelPacked
+  8%|█████████▋                                                                                                               | 2/25 [00:09<01:44,  4.55s/it]DEBUG fm_wrapper k_model: About to call transformer, type = DynamicSwap_HunyuanVideoTransformer3DModelPacked
+ 12%|██████████████▌                                                                                                          | 3/25 [00:13<01:40,  4.55s/it]DEBUG fm_wrapper k_model: About to call transformer, type = DynamicSwap_HunyuanVideoTransformer3DModelPacked
+ 16%|███████████████████▎                                                                                                     | 4/25 [00:18<01:35,  4.55s/it]DEBUG fm_wrapper k_model: About to call transformer, type = DynamicSwap_HunyuanVideoTransformer3DModelPacked
+ 20%|████████████████████████▏                                                                                                | 5/25 [00:22<01:31,  4.56s/it]DEBUG fm_wrapper k_model: About to call transformer, type = DynamicSwap_HunyuanVideoTransformer3DModelPacked
+ 24%|█████████████████████████████                                                                                            | 6/25 [00:27<01:26,  4.56s/it]DEBUG fm_wrapper k_model: About to call transformer, type = DynamicSwap_HunyuanVideoTransformer3DModelPacked
+ 28%|█████████████████████████████████▉                                                                                       | 7/25 [00:31<01:22,  4.56s/it]DEBUG fm_wrapper k_model: About to call transformer, type = DynamicSwap_HunyuanVideoTransformer3DModelPacked
+ 32%|██████████████████████████████████████▋                                                                                  | 8/25 [00:36<01:17,  4.56s/it]DEBUG fm_wrapper k_model: About to call transformer, type = DynamicSwap_HunyuanVideoTransformer3DModelPacked
+ 36%|███████████████████████████████████████████▌                                                                             | 9/25 [00:41<01:12,  4.56s/it]DEBUG fm_wrapper k_model: About to call transformer, type = DynamicSwap_HunyuanVideoTransformer3DModelPacked
+ 40%|████████████████████████████████████████████████                                                                        | 10/25 [00:45<01:08,  4.56s/it]DEBUG fm_wrapper k_model: About to call transformer, type = DynamicSwap_HunyuanVideoTransformer3DModelPacked
+ 44%|████████████████████████████████████████████████████▊                                                                   | 11/25 [00:50<01:03,  4.56s/it]DEBUG fm_wrapper k_model: About to call transformer, type = DynamicSwap_HunyuanVideoTransformer3DModelPacked
+ 48%|█████████████████████████████████████████████████████████▌                                                              | 12/25 [00:54<00:59,  4.56s/it]DEBUG fm_wrapper k_model: About to call transformer, type = DynamicSwap_HunyuanVideoTransformer3DModelPacked
+ 52%|██████████████████████████████████████████████████████████████▍                                                         | 13/25 [00:59<00:54,  4.56s/it]DEBUG fm_wrapper k_model: About to call transformer, type = DynamicSwap_HunyuanVideoTransformer3DModelPacked
+ 56%|███████████████████████████████████████████████████████████████████▏                                                    | 14/25 [01:03<00:50,  4.57s/it]DEBUG fm_wrapper k_model: About to call transformer, type = DynamicSwap_HunyuanVideoTransformer3DModelPacked
+ 60%|████████████████████████████████████████████████████████████████████████                                                | 15/25 [01:08<00:45,  4.57s/it]DEBUG fm_wrapper k_model: About to call transformer, type = DynamicSwap_HunyuanVideoTransformer3DModelPacked
+ 64%|████████████████████████████████████████████████████████████████████████████▊                                           | 16/25 [01:12<00:41,  4.57s/it]DEBUG fm_wrapper k_model: About to call transformer, type = DynamicSwap_HunyuanVideoTransformer3DModelPacked
+ 68%|█████████████████████████████████████████████████████████████████████████████████▌                                      | 17/25 [01:17<00:36,  4.57s/it]DEBUG fm_wrapper k_model: About to call transformer, type = DynamicSwap_HunyuanVideoTransformer3DModelPacked
+ 72%|██████████████████████████████████████████████████████████████████████████████████████▍                                 | 18/25 [01:22<00:31,  4.57s/it]DEBUG fm_wrapper k_model: About to call transformer, type = DynamicSwap_HunyuanVideoTransformer3DModelPacked
+ 76%|███████████████████████████████████████████████████████████████████████████████████████████▏                            | 19/25 [01:26<00:27,  4.57s/it]DEBUG fm_wrapper k_model: About to call transformer, type = DynamicSwap_HunyuanVideoTransformer3DModelPacked
+ 80%|████████████████████████████████████████████████████████████████████████████████████████████████                        | 20/25 [01:31<00:22,  4.57s/it]DEBUG fm_wrapper k_model: About to call transformer, type = DynamicSwap_HunyuanVideoTransformer3DModelPacked
+ 84%|████████████████████████████████████████████████████████████████████████████████████████████████████▊                   | 21/25 [01:35<00:18,  4.57s/it]DEBUG fm_wrapper k_model: About to call transformer, type = DynamicSwap_HunyuanVideoTransformer3DModelPacked
+ 88%|█████████████████████████████████████████████████████████████████████████████████████████████████████████▌              | 22/25 [01:40<00:13,  4.57s/it]DEBUG fm_wrapper k_model: About to call transformer, type = DynamicSwap_HunyuanVideoTransformer3DModelPacked
+ 92%|██████████████████████████████████████████████████████████████████████████████████████████████████████████████▍         | 23/25 [01:44<00:09,  4.57s/it]DEBUG fm_wrapper k_model: About to call transformer, type = DynamicSwap_HunyuanVideoTransformer3DModelPacked
+ 96%|███████████████████████████████████████████████████████████████████████████████████████████████████████████████████▏    | 24/25 [01:49<00:04,  4.57s/it]DEBUG fm_wrapper k_model: About to call transformer, type = DynamicSwap_HunyuanVideoTransformer3DModelPacked
+100%|████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 25/25 [01:54<00:00,  4.56s/it]
+Offloading DynamicSwap_HunyuanVideoTransformer3DModelPacked from cuda:0 to preserve memory: 8 GB
+Force freeing VRAM to reach 10.0 GB...
+After clearing: 25.89 GB free
+Loaded AutoencoderKLHunyuanVideo to cuda:0 as complete.
+Unloaded AutoencoderKLHunyuanVideo as complete.
+Force freeing VRAM to reach 2.0 GB...
+After clearing: 25.89 GB free
+Decoded. Current latent shape torch.Size([1, 16, 33, 64, 96]); pixel shape torch.Size([1, 3, 81, 512, 768])
+Attempting to save runtime cache for "first_block_cache" to: /workspace/framepack_cython/FramePack/Cache/runtime_caches/first_block_cache.pt
+Successfully saved runtime cache for "first_block_cache".
+Attempting to save runtime cache for "similarity_cache" to: /workspace/framepack_cython/FramePack/Cache/runtime_caches/similarity_cache.pt
+Successfully saved runtime cache for "similarity_cache".

@@ -2207,7 +2207,7 @@ ACTIVE_RELATIONSHIP_MODE = "off"
 relationship_trainer = None
 try:
     # inner_dim of the transformer is num_attention_heads * attention_head_dim = 24 * 128 = 3072
-    relationship_trainer = HiddenStateRelationshipTrainer(hidden_dim=3072, device=cpu)
+    relationship_trainer = HiddenStateRelationshipTrainer(hidden_dim=3072, device=str(cpu))
     rt_state = _load_runtime_cache_state("relationship_trainer")
     if rt_state:
         relationship_trainer.load_state_dict(rt_state)
