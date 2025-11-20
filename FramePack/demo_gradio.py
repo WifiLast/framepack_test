@@ -3490,12 +3490,12 @@ def worker(
                         trainer_batch_size,
                         gpu,
                     )
-                if processed > 0:
-                    avg_loss = total_loss / processed
-                    print(f"Residual predictors updated on {processed} samples; avg loss={avg_loss:.6f}")
-                    residual_payload = _export_relationship_trainer_states(RESIDUAL_TRAINERS, RESIDUAL_TRAINER_STATES)
-                    print("Persisting residual predictor cache to disk...")
-                    _save_runtime_cache_state(RELATIONSHIP_RESIDUAL_CACHE_NAME, residual_payload)
+                    if processed > 0:
+                        avg_loss = total_loss / processed
+                        print(f"Residual predictors updated on {processed} samples; avg loss={avg_loss:.6f}")
+                        residual_payload = _export_relationship_trainer_states(RESIDUAL_TRAINERS, RESIDUAL_TRAINER_STATES)
+                        print("Persisting residual predictor cache to disk...")
+                        _save_runtime_cache_state(RELATIONSHIP_RESIDUAL_CACHE_NAME, residual_payload)
                     else:
                         print("Residual predictor training skipped (no valid samples).")
                 elif normalized_trainer_mode == "modulation":
@@ -3506,12 +3506,12 @@ def worker(
                         trainer_batch_size,
                         gpu,
                     )
-                if processed > 0:
-                    avg_loss = total_loss / processed
-                    print(f"Modulation predictors updated on {processed} samples; avg loss={avg_loss:.6f}")
-                    modulation_payload = _export_relationship_trainer_states(MODULATION_TRAINERS, MODULATION_TRAINER_STATES)
-                    print("Persisting modulation predictor cache to disk...")
-                    _save_runtime_cache_state(RELATIONSHIP_MODULATION_CACHE_NAME, modulation_payload)
+                    if processed > 0:
+                        avg_loss = total_loss / processed
+                        print(f"Modulation predictors updated on {processed} samples; avg loss={avg_loss:.6f}")
+                        modulation_payload = _export_relationship_trainer_states(MODULATION_TRAINERS, MODULATION_TRAINER_STATES)
+                        print("Persisting modulation predictor cache to disk...")
+                        _save_runtime_cache_state(RELATIONSHIP_MODULATION_CACHE_NAME, modulation_payload)
                     else:
                         print("Modulation predictor training skipped (no valid samples).")
                 else:
