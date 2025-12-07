@@ -16,6 +16,9 @@ class DynamicSwapInstaller:
         original_class = module.__class__
         module.__dict__['forge_backup_original_class'] = original_class
 
+        # Store kwargs for use in hooks
+        module.__dict__['_dynamic_swap_kwargs'] = kwargs
+
         def hacked_get_attr(self, name: str):
             # Handle device and dtype properties first - these are computed properties on nn.Module
             if name == 'device':
@@ -46,6 +49,30 @@ class DynamicSwapInstaller:
                     return _buffers[name].to(**kwargs)
             return super(original_class, self).__getattr__(name)
 
+        # Add forward pre-hook to move weights to target device before forward pass
+        def _pre_forward_hook(mod, inputs):
+            swap_kwargs = getattr(mod, '_dynamic_swap_kwargs', kwargs)
+            device = swap_kwargs.get('device', None)
+            if device is None:
+                return None
+
+            # Only move parameters of THIS module (not submodules)
+            # Each submodule has its own hook, so we don't need to recurse
+            for name, param in mod._parameters.items():
+                if param is not None and hasattr(param, 'to') and param.device != device:
+                    mod._parameters[name] = torch.nn.Parameter(param.to(**swap_kwargs), requires_grad=param.requires_grad)
+
+            # Move buffers of THIS module
+            for name, buffer in mod._buffers.items():
+                if buffer is not None and hasattr(buffer, 'to') and buffer.device != device:
+                    mod._buffers[name] = buffer.to(**swap_kwargs)
+
+            return None
+
+        # Register the hook
+        handle = module.register_forward_pre_hook(_pre_forward_hook)
+        module.__dict__['_dynamic_swap_hook_handle'] = handle
+
         # Also need to ensure forward() is called with all kwargs properly
         original_forward = original_class.forward
 
@@ -74,6 +101,14 @@ class DynamicSwapInstaller:
 
     @staticmethod
     def _uninstall_module(module: torch.nn.Module) -> None:
+        # Remove forward hook if it exists
+        if '_dynamic_swap_hook_handle' in module.__dict__:
+            handle = module.__dict__.pop('_dynamic_swap_hook_handle')
+            handle.remove()
+        # Remove stored kwargs
+        if '_dynamic_swap_kwargs' in module.__dict__:
+            module.__dict__.pop('_dynamic_swap_kwargs')
+        # Restore original class
         if 'forge_backup_original_class' in module.__dict__:
             module.__class__ = module.__dict__.pop('forge_backup_original_class')
 
@@ -82,6 +117,8 @@ class DynamicSwapInstaller:
         # Check if this is a LlamaModel that needs hidden_states support
         is_llama = 'LlamaModel' in model.__class__.__name__
 
+        # Install hook on ALL submodules so gradient checkpointing works
+        # Each module will move its own parameters before forward
         for m in model.modules():
             # For LlamaModel, skip wrapping the root model itself to avoid breaking hidden_states collection
             # Only wrap the submodules for memory optimization

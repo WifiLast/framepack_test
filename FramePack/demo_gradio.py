@@ -139,6 +139,69 @@ def _install_torch_compile_guard():
 
 
 _install_torch_compile_guard()
+
+HIP_VERSION = getattr(torch.version, "hip", None)
+RUNNING_ON_ROCM = bool(HIP_VERSION and HIP_VERSION != "0.0")
+CUDA_RUNTIME_AVAILABLE = torch.cuda.is_available() and not RUNNING_ON_ROCM
+if torch.cuda.is_available() and RUNNING_ON_ROCM:
+    hip_readable = HIP_VERSION or "unknown"
+    print(f"Detected AMD ROCm/HIP runtime (HIP {hip_readable}); CUDA-only optimizations will be skipped.")
+    # Enable experimental memory-efficient attention for ROCm
+    if "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL" not in os.environ:
+        os.environ["TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL"] = "1"
+        print("Enabled TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1 for better memory efficiency on AMD GPUs")
+    # More aggressive memory management for ROCm
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:128")
+    print(f"ROCm GPU: {torch.cuda.get_device_name(0)}")
+    free_gb, total_gb = torch.cuda.mem_get_info()
+    print(f"ROCm VRAM: {free_gb / (1024**3):.2f}GB free / {total_gb / (1024**3):.2f}GB total")
+
+_CUDA_BACKEND_WARNED_FLAGS = set()
+
+
+def _configure_cuda_matmul_backend(*, allow_tf32=None, allow_fp16_reduction=None):
+    cuda_backend = getattr(torch.backends, "cuda", None)
+    if cuda_backend is None:
+        return
+    matmul_backend = getattr(cuda_backend, "matmul", None)
+    if matmul_backend is None:
+        return
+    if allow_tf32 is not None and hasattr(matmul_backend, "allow_tf32"):
+        matmul_backend.allow_tf32 = allow_tf32
+    if allow_fp16_reduction is not None and hasattr(matmul_backend, "allow_fp16_reduced_precision_reduction"):
+        matmul_backend.allow_fp16_reduced_precision_reduction = allow_fp16_reduction
+
+
+def _configure_cudnn_backend(*, allow_tf32=None, benchmark=None):
+    cudnn_backend = getattr(torch.backends, "cudnn", None)
+    if cudnn_backend is None:
+        return
+    if allow_tf32 is not None and hasattr(cudnn_backend, "allow_tf32"):
+        cudnn_backend.allow_tf32 = allow_tf32
+    if benchmark is not None and hasattr(cudnn_backend, "benchmark"):
+        cudnn_backend.benchmark = benchmark
+
+
+def _enable_cuda_sdp_backends():
+    if not CUDA_RUNTIME_AVAILABLE:
+        return
+    cuda_backend = getattr(torch.backends, "cuda", None)
+    if cuda_backend is None:
+        return
+
+    for attr in ("enable_flash_sdp", "enable_mem_efficient_sdp", "enable_math_sdp"):
+        fn = getattr(cuda_backend, attr, None)
+        if not callable(fn):
+            continue
+        try:
+            fn(True)
+        except Exception as exc:
+            warn_key = f"{attr}_failed"
+            if warn_key in _CUDA_BACKEND_WARNED_FLAGS:
+                continue
+            print(f"Warning: Unable to enable torch.backends.cuda.{attr}: {exc}")
+            _CUDA_BACKEND_WARNED_FLAGS.add(warn_key)
+
 import traceback
 import einops
 import safetensors.torch as sf
@@ -540,11 +603,8 @@ def apply_bettertransformer_optimization(module, module_name="module", allow_bnb
             else:
                 print(f'PyTorch SDPA available but no config found for {module_name}')
 
-            # Enable memory efficient attention backends
-            # These work with quantized models because they optimize the attention computation
-            torch.backends.cuda.enable_flash_sdp(True)
-            torch.backends.cuda.enable_mem_efficient_sdp(True)
-            torch.backends.cuda.enable_math_sdp(True)
+            # Enable memory efficient attention backends (only when CUDA kernels exist)
+            _enable_cuda_sdp_backends()
 
             if is_bnb_quantized:
                 print(f'  → SDPA will use Flash/Memory-efficient attention with quantized weights')
@@ -1048,9 +1108,11 @@ class ModuleCacheWrapper(torch.nn.Module):
 
 torch.set_float32_matmul_precision("high")
 if torch.cuda.is_available():
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
-    torch.backends.cudnn.benchmark = True
+    _configure_cuda_matmul_backend(
+        allow_tf32=True if CUDA_RUNTIME_AVAILABLE else None,
+        allow_fp16_reduction=True,
+    )
+    _configure_cudnn_backend(benchmark=True)
 
 torch.set_grad_enabled(False)
 
@@ -1430,8 +1492,9 @@ if XFORMERS_MODE not in {"off", "standard", "aggressive"}:
 if XFORMERS_MODE == "aggressive":
     os.environ["XFORMERS_ATTENTION_OP"] = "cutlass"
     os.environ["XFORMERS_FORCE_DISABLE_DROPOUT"] = "1"
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
+    if CUDA_RUNTIME_AVAILABLE:
+        _configure_cuda_matmul_backend(allow_tf32=True)
+        _configure_cudnn_backend(allow_tf32=True)
 set_attention_accel_mode(XFORMERS_MODE)
 
 free_mem_gb = get_cuda_free_memory_gb(gpu)
@@ -2782,6 +2845,7 @@ transformer.requires_grad_(False)
 
 if not high_vram:
     # DynamicSwapInstaller is same as huggingface's enable_sequential_offload but 3x faster
+    # Now works with ROCm via forward pre-hooks
     if not USE_FSDP:
         DynamicSwapInstaller.install_model(transformer, device=gpu)
     if not USE_BITSANDBYTES:
@@ -3347,7 +3411,7 @@ def worker(
                 move_model_to_device_with_memory_preservation(transformer_to_move, target_device=gpu, preserved_memory_gb=gpu_memory_preservation)
 
             if use_teacache:
-                transformer_backbone.initialize_teacache(enable_teacache=True, num_steps=steps, rel_l1_thresh=0.05)
+                transformer_backbone.initialize_teacache(enable_teacache=True, num_steps=steps, rel_l1_thresh=0.3)
             else:
                 transformer_backbone.initialize_teacache(enable_teacache=False)
 
@@ -3422,10 +3486,12 @@ def worker(
 
             if not high_vram and not USE_FSDP:
                 # Aggressive offloading with synchronization
-                offload_model_from_device_for_memory_preservation(transformer, target_device=gpu, preserved_memory_gb=8, aggressive=True)
+                preserved_gb = 10 if RUNNING_ON_ROCM else 8
+                target_free_gb = 12.0 if RUNNING_ON_ROCM else 10.0
+                offload_model_from_device_for_memory_preservation(transformer, target_device=gpu, preserved_memory_gb=preserved_gb, aggressive=True)
 
                 # Force free VRAM before loading VAE
-                force_free_vram(target_gb=10.0)
+                force_free_vram(target_gb=target_free_gb)
 
                 # Use chunked loading for VAE if needed
                 try:

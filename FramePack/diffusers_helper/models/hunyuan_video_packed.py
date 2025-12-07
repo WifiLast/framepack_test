@@ -33,18 +33,28 @@ enabled_backends = []
 
 ATTN_ACCEL_MODE = "standard"
 
+
 def set_attention_accel_mode(mode: str):
     global ATTN_ACCEL_MODE
     ATTN_ACCEL_MODE = mode.lower()
 
-if torch.backends.cuda.flash_sdp_enabled():
-    enabled_backends.append("flash")
-if torch.backends.cuda.math_sdp_enabled():
-    enabled_backends.append("math")
-if torch.backends.cuda.mem_efficient_sdp_enabled():
-    enabled_backends.append("mem_efficient")
-if torch.backends.cuda.cudnn_sdp_enabled():
-    enabled_backends.append("cudnn")
+
+def _append_if_enabled(result_list: List[str], backend_module, attr: str, name: str):
+    fn = getattr(backend_module, attr, None)
+    if callable(fn):
+        try:
+            if fn():
+                result_list.append(name)
+        except Exception:
+            pass
+
+
+_cuda_backends = getattr(torch.backends, "cuda", None)
+if _cuda_backends is not None:
+    _append_if_enabled(enabled_backends, _cuda_backends, "flash_sdp_enabled", "flash")
+    _append_if_enabled(enabled_backends, _cuda_backends, "math_sdp_enabled", "math")
+    _append_if_enabled(enabled_backends, _cuda_backends, "mem_efficient_sdp_enabled", "mem_efficient")
+    _append_if_enabled(enabled_backends, _cuda_backends, "cudnn_sdp_enabled", "cudnn")
 
 print("Currently enabled native sdp backends:", enabled_backends)
 
@@ -1027,7 +1037,7 @@ class HunyuanVideoTransformer3DModelPacked(ModelMixin, ConfigMixin, PeftAdapterM
         self.use_gradient_checkpointing = False
         print('self.use_gradient_checkpointing = False')
 
-    def initialize_teacache(self, enable_teacache=True, num_steps=25, rel_l1_thresh=0.05):
+    def initialize_teacache(self, enable_teacache=True, num_steps=25, rel_l1_thresh=0.3):
         self.enable_teacache = enable_teacache
         self.cnt = 0
         self.num_steps = num_steps
@@ -1038,6 +1048,25 @@ class HunyuanVideoTransformer3DModelPacked(ModelMixin, ConfigMixin, PeftAdapterM
         self.teacache_rescale_func = np.poly1d([7.33226126e+02, -4.01131952e+02, 6.75869174e+01, -3.14987800e+00, 9.61237896e-02])
         self.max_teacache_delta = 0.0
         self.last_teacache_delta = None
+
+    def _ensure_module_device(self, module: Optional[nn.Module], reference: Optional[torch.Tensor]):
+        if module is None or reference is None:
+            return module
+        ref_device = reference.device
+        try:
+            sample = next(module.parameters())
+        except StopIteration:
+            sample = None
+        if sample is None:
+            try:
+                sample = next(module.buffers())
+            except StopIteration:
+                sample = None
+        if sample is None:
+            return module
+        if sample.device != ref_device:
+            module.to(ref_device)
+        return module
 
     def gradient_checkpointing_method(self, block, *args):
         if self.use_gradient_checkpointing:
@@ -1055,6 +1084,7 @@ class HunyuanVideoTransformer3DModelPacked(ModelMixin, ConfigMixin, PeftAdapterM
             clean_latents_2x=None, clean_latent_2x_indices=None,
             clean_latents_4x=None, clean_latent_4x_indices=None
     ):
+        self._ensure_module_device(self.x_embedder, latents)
         hidden_states = self.gradient_checkpointing_method(self.x_embedder.proj, latents)
         B, C, T, H, W = hidden_states.shape
 
@@ -1068,6 +1098,7 @@ class HunyuanVideoTransformer3DModelPacked(ModelMixin, ConfigMixin, PeftAdapterM
 
         if clean_latents is not None and clean_latent_indices is not None:
             clean_latents = clean_latents.to(hidden_states)
+            self._ensure_module_device(self.clean_x_embedder, clean_latents)
             clean_latents = self.gradient_checkpointing_method(self.clean_x_embedder.proj, clean_latents)
             clean_latents = clean_latents.flatten(2).transpose(1, 2)
 
@@ -1079,6 +1110,7 @@ class HunyuanVideoTransformer3DModelPacked(ModelMixin, ConfigMixin, PeftAdapterM
 
         if clean_latents_2x is not None and clean_latent_2x_indices is not None:
             clean_latents_2x = clean_latents_2x.to(hidden_states)
+            self._ensure_module_device(self.clean_x_embedder, clean_latents_2x)
             clean_latents_2x = pad_for_3d_conv(clean_latents_2x, (2, 4, 4))
             clean_latents_2x = self.gradient_checkpointing_method(self.clean_x_embedder.proj_2x, clean_latents_2x)
             clean_latents_2x = clean_latents_2x.flatten(2).transpose(1, 2)
@@ -1093,6 +1125,7 @@ class HunyuanVideoTransformer3DModelPacked(ModelMixin, ConfigMixin, PeftAdapterM
 
         if clean_latents_4x is not None and clean_latent_4x_indices is not None:
             clean_latents_4x = clean_latents_4x.to(hidden_states)
+            self._ensure_module_device(self.clean_x_embedder, clean_latents_4x)
             clean_latents_4x = pad_for_3d_conv(clean_latents_4x, (4, 8, 8))
             clean_latents_4x = self.gradient_checkpointing_method(self.clean_x_embedder.proj_4x, clean_latents_4x)
             clean_latents_4x = clean_latents_4x.flatten(2).transpose(1, 2)
@@ -1130,11 +1163,14 @@ class HunyuanVideoTransformer3DModelPacked(ModelMixin, ConfigMixin, PeftAdapterM
 
         hidden_states, rope_freqs = self.process_input_hidden_states(hidden_states, latent_indices, clean_latents, clean_latent_indices, clean_latents_2x, clean_latent_2x_indices, clean_latents_4x, clean_latent_4x_indices)
 
+        self._ensure_module_device(self.time_text_embed, hidden_states)
         temb = self.gradient_checkpointing_method(self.time_text_embed, timestep, guidance, pooled_projections)
+        self._ensure_module_device(self.context_embedder, hidden_states)
         encoder_hidden_states = self.gradient_checkpointing_method(self.context_embedder, encoder_hidden_states, timestep, encoder_attention_mask)
 
         if self.image_projection is not None:
             assert image_embeddings is not None, 'You must use image embeddings!'
+            self._ensure_module_device(self.image_projection, image_embeddings)
             extra_encoder_hidden_states = self.gradient_checkpointing_method(self.image_projection, image_embeddings)
             extra_attention_mask = torch.ones((batch_size, extra_encoder_hidden_states.shape[1]), dtype=encoder_attention_mask.dtype, device=encoder_attention_mask.device)
 
