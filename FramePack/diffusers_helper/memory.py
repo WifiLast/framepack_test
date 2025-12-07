@@ -51,21 +51,42 @@ class DynamicSwapInstaller:
 
         # Add forward pre-hook to move weights to target device before forward pass
         def _pre_forward_hook(mod, inputs):
+            import sys
             swap_kwargs = getattr(mod, '_dynamic_swap_kwargs', kwargs)
             device = swap_kwargs.get('device', None)
             if device is None:
                 return None
 
+            moved = 0
+            skipped = 0
+            none_params = 0
             # Only move parameters of THIS module (not submodules)
             # Each submodule has its own hook, so we don't need to recurse
             for name, param in mod._parameters.items():
-                if param is not None and hasattr(param, 'to') and param.device != device:
-                    mod._parameters[name] = torch.nn.Parameter(param.to(**swap_kwargs), requires_grad=param.requires_grad)
+                if param is None:
+                    none_params += 1
+                    continue
+                if hasattr(param, 'to'):
+                    if param.device != device:
+                        mod._parameters[name] = torch.nn.Parameter(param.to(**swap_kwargs), requires_grad=param.requires_grad)
+                        moved += 1
+                    else:
+                        skipped += 1
 
             # Move buffers of THIS module
             for name, buffer in mod._buffers.items():
-                if buffer is not None and hasattr(buffer, 'to') and buffer.device != device:
-                    mod._buffers[name] = buffer.to(**swap_kwargs)
+                if buffer is None:
+                    continue
+                if hasattr(buffer, 'to'):
+                    if buffer.device != device:
+                        mod._buffers[name] = buffer.to(**swap_kwargs)
+                        moved += 1
+                    else:
+                        skipped += 1
+
+            total_params = len(mod._parameters)
+            if moved > 0 or (moved == 0 and skipped == 0 and total_params > 0):
+                print(f"DEBUG: Hook for {mod.__class__.__name__}: moved={moved}, skipped={skipped}, none={none_params}, total={total_params}", file=sys.stderr)
 
             return None
 
@@ -114,17 +135,22 @@ class DynamicSwapInstaller:
 
     @staticmethod
     def install_model(model: torch.nn.Module, **kwargs: Any) -> None:
+        import sys
         # Check if this is a LlamaModel that needs hidden_states support
         is_llama = 'LlamaModel' in model.__class__.__name__
 
         # Install hook on ALL submodules so gradient checkpointing works
         # Each module will move its own parameters before forward
+        count = 0
         for m in model.modules():
             # For LlamaModel, skip wrapping the root model itself to avoid breaking hidden_states collection
             # Only wrap the submodules for memory optimization
             if is_llama and m is model:
                 continue
             DynamicSwapInstaller._install_module(m, **kwargs)
+            count += 1
+
+        print(f"DEBUG: Installed DynamicSwapInstaller on {count} modules for {model.__class__.__name__}", file=sys.stderr)
 
     @staticmethod
     def uninstall_model(model: torch.nn.Module) -> None:
