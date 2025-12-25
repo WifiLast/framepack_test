@@ -31,7 +31,7 @@ from diffusers_helper.kv_cache import (
 
 enabled_backends = []
 
-ATTN_ACCEL_MODE = "standard"
+ATTN_ACCEL_MODE = "off"
 
 
 def set_attention_accel_mode(mode: str):
@@ -171,7 +171,7 @@ def attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seq
             except Exception as exc:
                 _maybe_disable_flash_attn(exc, varlen=False)
 
-        if xformers_attn_func is not None:
+        if ATTN_ACCEL_MODE != "off" and xformers_attn_func is not None:
             x = xformers_attn_func(q, k, v)
             return x
 

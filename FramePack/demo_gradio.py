@@ -2,6 +2,7 @@ from diffusers_helper.hf_login import login
 
 import os
 import atexit
+import importlib.util
 
 HF_HOME = os.path.abspath(os.path.realpath(os.path.join(os.path.dirname(__file__), './hf_download')))
 os.environ['HF_HOME'] = HF_HOME
@@ -36,6 +37,26 @@ def _prepare_local_repo(repo_id: str, env_var: str, *, preload: bool, parallel_w
     except Exception as exc:
         print(f'Warning: unable to preload {repo_id}: {exc}')
         return repo_id
+
+def _initialize_custom_zluda_support() -> bool:
+    """Load the bundled ZLUDA shim before torch initializes."""
+    zluda_path = os.path.join(os.path.dirname(__file__), "customzluda", "zluda-default.py")
+    if not os.path.isfile(zluda_path):
+        return False
+    spec = importlib.util.spec_from_file_location("framepack_customzluda_default", zluda_path)
+    if not spec or not spec.loader:
+        print(f"Warning: unable to load spec for custom ZLUDA module at {zluda_path}")
+        return False
+    try:
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return True
+    except Exception as exc:
+        print(f"Warning: failed to initialize custom ZLUDA module ({exc})")
+        return False
+
+
+_initialize_custom_zluda_support()
 
 import gradio as gr
 import gradio.route_utils as gr_route_utils
