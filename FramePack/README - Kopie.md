@@ -90,13 +90,17 @@ FramePack ships with an inference-focused execution engine. Models are always sw
 
 These knobs keep inference paths deterministic while allowing you to trade build time for runtime performance when deploying on constrained GPUs or exporting TorchScript modules.
 
-The software supports PyTorch attention, xformers, flash-attn, sage-attention. By default, it will just use PyTorch attention. You can install those attention kernels if you know how. 
+The software supports PyTorch attention, xformers, flash-attn, and sage-attention. **SageAttention is now enabled by default** and will be installed automatically via requirements.txt (version 1.0.6).
 
-For example, to install sage-attention (linux):
+**Attention Backend Priority:**
+1. **SageAttention** (default, highest priority if installed)
+2. Flash Attention (if installed)
+3. Xformers (disabled by default, enable with `--xformers-mode standard`)
+4. PyTorch scaled_dot_product_attention (fallback)
 
-    pip install sageattention==1.0.6
+SageAttention provides excellent performance with minimal impact on output quality. If you experience any issues, you can uninstall it with:
 
-However, you are highly recommended to first try without sage-attention since it will influence results, though the influence is minimal.
+    pip uninstall sageattention
 
 # GUI
 

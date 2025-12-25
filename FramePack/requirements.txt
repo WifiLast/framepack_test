@@ -28,7 +28,7 @@ bitsandbytes  # For 4-bit quantization (BNB)
 
 # Optional: Advanced Attention Backends
 # flash-attn>=2.0.0  # Flash Attention (may conflict with TensorRT)
-# sageattention  # Sage Attention backend
+sageattention==1.0.6  # Sage Attention backend (enabled by default)
 
 # Optional: TensorRT Acceleration (experimental)
 # torch-tensorrt  # Requires CUDA toolkit and compatible PyTorch version
